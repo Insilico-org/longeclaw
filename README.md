@@ -306,7 +306,7 @@ you> train a model on inflammatory response genes in blood
 
 Autocomplete: `@` for file paths, `g@` for gene names, `cl@` for clock names, `/` for commands and saved skills.
 
-Commands: `/help`, `/clocks`, `/skills`, `/allowed`, `/grant <path>`, `/loop [freq] <task>`, `/save`, `/showwhy` (agent reasoning trace), `/clear`, `/model`, `/quit`. Invoke a saved skill with `/<skill-name>`. `/loop` repeats a request on a timer (e.g. `/loop 30m check PubMed for new GrimAge papers`) until Ctrl-C.
+Commands: `/help`, `/clocks`, `/skills`, `/allowed`, `/grant <path>`, `/loop [freq] <task>`, `/effort low|medium|high|max`, `/usage`, `/save`, `/showwhy` (agent reasoning trace), `/clear`, `/model`, `/quit`. Invoke a saved skill with `/<skill-name>`. `/loop` repeats a request on a timer (e.g. `/loop 30m check PubMed for new GrimAge papers`) until Ctrl-C. `/effort` caps how many tools the agent may call per response (low 5, medium 10, high 20, max unlimited) to control latency — skills bypass the cap. `/usage` shows session token/model/tool/skill usage.
 
 **Type-ahead:** while the agent is working on your question, you can start typing the next one -- it is held and sent automatically once the current answer is rendered, so you never have to wait on the model to compose a follow-up. Press **Esc** (or Ctrl-C) to interrupt a running request; it stops at the next step and shows "Interrupted by user".
 

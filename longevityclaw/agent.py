@@ -147,6 +147,11 @@ TOOL_LABELS = {
 }
 
 
+# Effort levels: max tool calls the agent may make for a single normal chat
+# response (None = unlimited). Skills bypass the cap once invoked.
+EFFORT_LEVELS = {"low": 5, "medium": 10, "high": 20, "max": None}
+DEFAULT_EFFORT = "high"
+
 # Context management constants
 MAX_CONTEXT_CHARS = 400_000  # ~100K tokens, safe for 200K context window
 TRUNCATE_AFTER_ROUNDS = 3    # keep last N assistant+tool rounds intact
@@ -191,6 +196,13 @@ class LongevityClawAgent:
             "skills": {},   # skill name -> run count
         }
 
+        # Effort: max tool calls per normal response (None = unlimited). Skills,
+        # once invoked in a response, lift the cap for the rest of that response.
+        env_effort = os.environ.get("LONGEVITYCLAW_EFFORT", DEFAULT_EFFORT).strip().lower()
+        self.effort = env_effort if env_effort in EFFORT_LEVELS else DEFAULT_EFFORT
+        self.tool_budget = EFFORT_LEVELS[self.effort]
+        self._skill_invoked = False  # per-chat: set when run_skill is called
+
         kwargs = {}
         foundry_endpoint = os.environ.get("ANTHROPIC_FOUNDRY_ENDPOINT")
         foundry_key = os.environ.get("ANTHROPIC_FOUNDRY_API_KEY")
@@ -229,6 +241,16 @@ class LongevityClawAgent:
     def is_cancelled(self) -> bool:
         """True if the most recent chat() was cancelled (until the next call)."""
         return self._cancel.is_set()
+
+    def set_effort(self, level: str) -> bool:
+        """Set the per-response tool-call budget (low/medium/high/max). Returns
+        True if the level is valid."""
+        level = level.strip().lower()
+        if level not in EFFORT_LEVELS:
+            return False
+        self.effort = level
+        self.tool_budget = EFFORT_LEVELS[level]
+        return True
 
     def _fmt_tokens(self, n: int) -> str:
         if n >= 1000:
@@ -352,6 +374,7 @@ class LongevityClawAgent:
         self._clocks_computed = 0
         self._cancel.clear()
         self._generating = True
+        self._skill_invoked = False
 
         # Trace for this request
         trace = {
@@ -390,14 +413,41 @@ class LongevityClawAgent:
             memory_context = memory.get_context_prompt()
             system_prompt = SYSTEM_PROMPT + memory_context if memory_context else SYSTEM_PROMPT
 
+            # Effort cap: tell the model its tool-call budget up front (and the
+            # live remaining count) so it PLANS within it, rather than only being
+            # truncated after the fact. When the budget is spent, withhold tools
+            # so it answers with what it has. Skills lift the cap entirely.
+            create_kwargs = {
+                "model": self.model,
+                "max_tokens": 16384,
+                "messages": self.messages,
+            }
+            capped = self.tool_budget is not None and not self._skill_invoked
+            if not capped:
+                create_kwargs["tools"] = self.tools
+            else:
+                remaining = self.tool_budget - len(self._tools_called)
+                if remaining > 0:
+                    create_kwargs["tools"] = self.tools
+                    system_prompt += (
+                        f"\n\nTOOL-CALL BUDGET: This response is limited to "
+                        f"{self.tool_budget} tool call(s) total (effort '{self.effort}'); "
+                        f"{len(self._tools_called)} used, {remaining} remaining. Plan to fully "
+                        f"answer within this budget — pick the most informative tools first, "
+                        f"batch what you can, and do not assume you can make more than "
+                        f"{remaining} further call(s). (Running a saved skill lifts this cap.)"
+                    )
+                else:  # budget spent — withhold tools, answer now
+                    system_prompt += (
+                        f"\n\nTOOL-CALL BUDGET REACHED ({self.tool_budget} calls, effort "
+                        f"'{self.effort}'). Do not request more tools — answer now with the "
+                        f"information already gathered; if something could not be completed, "
+                        f"say so briefly."
+                    )
+            create_kwargs["system"] = system_prompt
+
             t0 = time.time()
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=16384,
-                system=system_prompt,
-                tools=self.tools,
-                messages=self.messages,
-            )
+            response = self.client.messages.create(**create_kwargs)
             elapsed = time.time() - t0
             self._stop_thinking_timer()
 
@@ -453,11 +503,19 @@ class LongevityClawAgent:
             # Handle tool calls
             tool_results = []
             n_tools = len(tool_blocks)
-            tool_names_this_round = [b.name for b in tool_blocks]
 
-            for i, block in enumerate(response.content):
+            tool_no = 0
+            for block in response.content:
                 if block.type != "tool_use":
                     continue
+                # Count only tool blocks (response.content also holds text blocks),
+                # so the "[k/n]" status can't overflow.
+                tool_no += 1
+
+                # A skill invocation lifts the tool-call cap for the rest of this
+                # response — skills are explicit, user-requested procedures.
+                if block.name == "run_skill":
+                    self._skill_invoked = True
 
                 label = TOOL_LABELS.get(block.name, block.name)
                 # Surface the target path for file operations.
@@ -465,7 +523,24 @@ class LongevityClawAgent:
                     target = block.input.get("file_path") or block.input.get("dir_path")
                     if target:
                         label = f"{label}: {target}"
-                prefix = f"[{i+1}/{n_tools}] " if n_tools > 1 else ""
+                prefix = f"[{tool_no}/{n_tools}] " if n_tools > 1 else ""
+
+                # Enforce the effort cap even within a single round: if the budget
+                # is already spent, don't run further tools — return a stub result.
+                if (self.tool_budget is not None and not self._skill_invoked
+                        and len(self._tools_called) >= self.tool_budget):
+                    self.on_status(f"{prefix}{label} — skipped (tool budget reached)")
+                    stub = json.dumps({"error": "Tool-call budget reached for this "
+                                       "response; not executed. Answer with what you have."})
+                    round_trace["tool_calls"].append({
+                        "name": block.name, "input": block.input,
+                        "result": stub, "duration": 0.0, "error": True,
+                    })
+                    tool_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": stub, "is_error": True,
+                    })
+                    continue
 
                 handler = self.handlers.get(block.name)
                 if handler:

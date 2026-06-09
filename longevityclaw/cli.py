@@ -131,6 +131,7 @@ COMMANDS = {
     "/grant": "Grant the agent access to a file or folder (/grant <path>)",
     "/loop": "Repeat a request on a timer (/loop [freq] <task>, Ctrl-C to stop)",
     "/empty_queue": "Clear any follow-up message you've queued",
+    "/effort": "Cap tool calls per response (/effort low|medium|high|max)",
     "/usage": "Show session token/model/tool/skill usage (Esc to dismiss)",
     "/save": "Save conversation to markdown file",
     "/showwhy": "Show agent reasoning trace for a recent request",
@@ -149,6 +150,7 @@ COMMAND_HELP = f"""
   [{C_MID}]/grant[/{C_MID}]     Grant access to a file or folder — "/grant ~/data/project"
   [{C_MID}]/loop[/{C_MID}]      Repeat a request on a timer — "/loop 30m check PubMed for new GrimAge papers" (Ctrl-C stops)
   [{C_MID}]/empty_queue[/{C_MID}]  Clear a follow-up you queued while the model was working
+  [{C_MID}]/effort[/{C_MID}]    Cap tool calls per response — low (5) · medium (10) · high (20) · max (unlimited); skills bypass it
   [{C_MID}]/usage[/{C_MID}]     Show session usage — tokens by model, L-LLM calls, tools & skills (Esc to dismiss)
   [{C_MID}]/save[/{C_MID}]      Save conversation to markdown (optional: /save filename.md)
   [{C_MID}]/showwhy[/{C_MID}]   Show agent reasoning trace (tool calls, inputs, results)
@@ -526,6 +528,7 @@ TIPS = [
     "press Esc while the model is working to interrupt it",
     "/showwhy reveals the agent's tool calls and reasoning",
     "/skill-builder turns what you just did into a reusable skill",
+    "/effort low|medium|high|max caps tool calls per response (lower = faster)",
     _QUEUE_TIP,
 ]
 
@@ -556,8 +559,9 @@ def _make_chrome(bar_text, tip: str):
     return _message
 
 
-def _idle_bar_text() -> str:
-    return "LongevityClaw    Esc clear · Ctrl-C interrupt · Tab complete"
+def _idle_bar_text(effort: str = "") -> str:
+    head = "LongevityClaw" + (f"  ·  effort: {effort}" if effort else "")
+    return f"{head}    Esc clear · Ctrl-C interrupt · Tab complete"
 
 
 # ── /usage: transient session-usage table (erased on Esc) ──────────────
@@ -605,7 +609,9 @@ def _usage_renderable(agent):
     extra.add_row("skills", str(len(skills)), str(sum(skills.values())),
                   ", ".join(f"{k}×{v}" for k, v in skills.items()) or "—")
 
-    return Group(f"[bold {C_BRIGHT}]Session usage[/bold {C_BRIGHT}]", "",
+    cap = "unlimited" if agent.tool_budget is None else f"max {agent.tool_budget} tools/response"
+    return Group(f"[bold {C_BRIGHT}]Session usage[/bold {C_BRIGHT}]   "
+                 f"[{C_DARK}]effort: {agent.effort} ({cap})[/{C_DARK}]", "",
                  models, "", extra)
 
 
@@ -1153,7 +1159,7 @@ def main():
                 demo_echoed = True
             else:
                 user_input = session.prompt(
-                    _make_chrome(_idle_bar_text, _pick_tip()),
+                    _make_chrome(lambda: _idle_bar_text(agent.effort), _pick_tip()),
                     default=pending_default,
                 ).strip()
                 user_input = PASTE_MARKER_RE.sub(
@@ -1261,6 +1267,26 @@ def main():
                 console.print(f"[{C_DARK}]  queue cleared[/{C_DARK}]" if pending
                               else f"[{C_DARK}]  nothing queued[/{C_DARK}]")
                 pending = None
+                continue
+
+            elif cmd == "/effort":
+                from .agent import EFFORT_LEVELS
+
+                def _cap_str(lvl):
+                    cap = EFFORT_LEVELS[lvl]
+                    return "unlimited" if cap is None else f"{cap} tool calls/response"
+
+                parts = user_input.split(maxsplit=1)
+                if len(parts) > 1:
+                    lvl = parts[1].strip().lower()
+                    if agent.set_effort(lvl):
+                        console.print(f"[{C_MID}]  effort: {lvl}[/{C_MID}] [{C_DARK}]({_cap_str(lvl)})[/{C_DARK}]")
+                    else:
+                        console.print(f"[{C_DARK}]  usage: /effort low|medium|high|max[/{C_DARK}]")
+                else:
+                    console.print(f"[{C_MID}]  effort: {agent.effort}[/{C_MID}] [{C_DARK}]({_cap_str(agent.effort)})[/{C_DARK}]")
+                    console.print(f"[{C_DARK}]  set with: /effort low (5) · medium (10) · high (20) · max (unlimited)"
+                                  f" — skills bypass the cap[/{C_DARK}]")
                 continue
 
             elif cmd == "/usage":
