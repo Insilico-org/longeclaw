@@ -576,26 +576,31 @@ def _usage_renderable(agent):
 
     models = Table(title="Models & tokens", title_style=f"bold {C_BRIGHT}",
                    border_style=C_DEEP, header_style=C_MID, expand=False)
-    for col, j in (("model", "left"), ("calls", "right"),
-                   ("in", "right"), ("out", "right"), ("total", "right")):
+    for col, j in (("model", "left"), ("calls", "right"), ("in", "right"),
+                   ("cached", "right"), ("out", "right"), ("total", "right")):
         models.add_column(col, justify=j)
-    tot_in = tot_out = 0
+    tot_in = tot_out = tot_cached = 0
     for name, m in su["models"].items():
-        models.add_row(name, str(m["calls"]), f"{m['input']:,}",
-                       f"{m['output']:,}", f"{m['input'] + m['output']:,}")
-        tot_in += m["input"]; tot_out += m["output"]
+        # input_tokens is the uncached remainder — true input adds the cached part
+        true_in = m["input"] + m.get("cache_read", 0) + m.get("cache_write", 0)
+        cached = m.get("cache_read", 0)
+        models.add_row(name, str(m["calls"]), f"{true_in:,}",
+                       f"{cached:,}" if cached else "—",
+                       f"{m['output']:,}", f"{true_in + m['output']:,}")
+        tot_in += true_in; tot_out += m["output"]; tot_cached += cached
+    claude_in = tot_in  # cache only applies to the Claude model(s)
     if llm["calls"]:
         lname = "L-LLM: " + (", ".join(llm["by_model"]) or "longevity")
-        models.add_row(lname, str(llm["calls"]), f"{llm['input']:,}",
+        models.add_row(lname, str(llm["calls"]), f"{llm['input']:,}", "—",
                        f"{llm['output']:,}", f"{llm['input'] + llm['output']:,}")
         tot_in += llm["input"]; tot_out += llm["output"]
     if not su["models"] and not llm["calls"]:
-        models.add_row("(nothing yet)", "", "", "", "")
+        models.add_row("(nothing yet)", "", "", "", "", "")
     else:
         models.add_section()
-        models.add_row("[bold]total[/bold]", "",
-                       f"[bold]{tot_in:,}[/bold]", f"[bold]{tot_out:,}[/bold]",
-                       f"[bold]{tot_in + tot_out:,}[/bold]")
+        models.add_row("[bold]total[/bold]", "", f"[bold]{tot_in:,}[/bold]",
+                       f"[bold]{tot_cached:,}[/bold]" if tot_cached else "—",
+                       f"[bold]{tot_out:,}[/bold]", f"[bold]{tot_in + tot_out:,}[/bold]")
 
     extra = Table(title="Tools & skills", title_style=f"bold {C_BRIGHT}",
                   border_style=C_DEEP, header_style=C_MID, expand=False)
@@ -610,9 +615,23 @@ def _usage_renderable(agent):
                   ", ".join(f"{k}×{v}" for k, v in skills.items()) or "—")
 
     cap = "unlimited" if agent.tool_budget is None else f"max {agent.tool_budget} tools/response"
+    c = su.get("cache", {"read": 0, "write": 0})
+    hit = (c["read"] / claude_in * 100) if claude_in else 0
+    # Net tok-equiv vs no caching: each read costs 0.1× instead of 1× (save 0.9×);
+    # each write costs the TTL's premium over 1× (5m → 0.25×, 1h → 1.0×). Premium
+    # is read from agent so this number can never drift from the TTL we request.
+    from .agent import CACHE_WRITE_PREMIUM, CACHE_WRITE_MULTIPLIER, _CACHE_TTL
+    saved = int(c["read"] * 0.9 - c["write"] * CACHE_WRITE_PREMIUM)
+    cache_line = (f"[{C_DARK}]prompt cache:[/{C_DARK}] "
+                  f"[{C_MID}]{c['read']:,}[/{C_MID}] read (~0.1×) · "
+                  f"{c['write']:,} written (~{CACHE_WRITE_MULTIPLIER:g}×, {_CACHE_TTL} TTL) · "
+                  f"[{C_MID}]{hit:.0f}%[/{C_MID}] of Claude input cached "
+                  f"[{C_DARK}](≈{saved:,} tok-equiv {'saved' if saved >= 0 else 'lost'})[/{C_DARK}]"
+                  + ("   [dim](0 = caching inactive / silent invalidator)[/dim]"
+                     if not c["read"] else ""))
     return Group(f"[bold {C_BRIGHT}]Session usage[/bold {C_BRIGHT}]   "
                  f"[{C_DARK}]effort: {agent.effort} ({cap})[/{C_DARK}]", "",
-                 models, "", extra)
+                 models, "", extra, "", cache_line)
 
 
 def _render_ansi(renderable) -> str:

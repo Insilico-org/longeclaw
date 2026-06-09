@@ -17,7 +17,7 @@ No test suite exists. No linter is configured.
 
 ## Environment
 
-Requires `ANTHROPIC_API_KEY` in `.env` (loaded automatically). Optional: `ANTHROPIC_MODEL`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_FOUNDRY_ENDPOINT`, `ANTHROPIC_FOUNDRY_API_KEY`, `LONGEVITYCLAW_FS` (filesystem policy: `readwrite`/`readonly`/`off`, default `readwrite`), `LONGEVITYCLAW_WORKSPACE` (primary workspace dir, default `<repo>/workspace`), `LONGEVITYCLAW_ALLOWED` (os.pathsep-separated extra allowed paths), `LONGEVITYCLAW_EFFORT` (tool-call budget per response: low/medium/high/max, default high).
+Requires `ANTHROPIC_API_KEY` in `.env` (loaded automatically). Optional: `ANTHROPIC_MODEL`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_FOUNDRY_ENDPOINT`, `ANTHROPIC_FOUNDRY_API_KEY`, `LONGEVITYCLAW_FS` (filesystem policy: `readwrite`/`readonly`/`off`, default `readwrite`), `LONGEVITYCLAW_WORKSPACE` (primary workspace dir, default `<repo>/workspace`), `LONGEVITYCLAW_ALLOWED` (os.pathsep-separated extra allowed paths), `LONGEVITYCLAW_EFFORT` (tool-call budget per response: low/medium/high/max, default high), `LONGEVITYCLAW_CACHE_TTL` (Anthropic prompt-cache TTL: `5m`/`1h`, default `5m` — 5m is cheaper for rapid tool loops, 1h survives long between-turn pauses; ignored for non-Anthropic models).
 
 ## Architecture
 

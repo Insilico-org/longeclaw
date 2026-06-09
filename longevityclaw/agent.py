@@ -153,9 +153,39 @@ EFFORT_LEVELS = {"low": 5, "medium": 10, "high": 20, "max": None}
 DEFAULT_EFFORT = "high"
 
 # Context management constants
-MAX_CONTEXT_CHARS = 400_000  # ~100K tokens, safe for 200K context window
+# The emergency client-side trim threshold is derived per-model from the real
+# context window (see _resolve_context_budget): we keep history up to ~70% of the
+# window, then trim. Trimming rewrites history mid-prefix and invalidates prompt
+# caches, so it should fire rarely. These are only fallbacks for when the Models
+# API can't tell us the window (offline, or a non-Anthropic backend).
+DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000   # conservative: err low for unknown models
+_KNOWN_CONTEXT_WINDOWS = {                 # prefix-matched against the model id
+    "claude-opus-4-8": 1_000_000, "claude-opus-4-7": 1_000_000,
+    "claude-opus-4-6": 1_000_000, "claude-opus-4-5": 200_000,
+    "claude-sonnet-4-6": 1_000_000, "claude-haiku-4-5": 200_000,
+}
+# chars-budget ≈ window_tokens × this (≈70% of window; ~3.5 real chars/token).
+_CONTEXT_TRIM_FACTOR = 2.5
 TRUNCATE_AFTER_ROUNDS = 3    # keep last N assistant+tool rounds intact
 TOOL_RESULT_SUMMARY_LEN = 200  # chars to keep from truncated tool results
+
+# Anthropic prompt-cache write cost premium over base input, by TTL (per Anthropic
+# pricing): a 5-minute cache write costs 1.25× base input (premium 0.25); a 1-hour
+# write costs 2.0× (premium 1.0). _CACHE_TTL is the single source of truth — the
+# cache_control marker and the /usage savings estimate both read it, so the
+# displayed "tokens saved" can never drift from the TTL we actually request.
+#
+# User-selectable via LONGEVITYCLAW_CACHE_TTL ("5m" or "1h"; default 5m). 5m
+# minimizes write cost during rapid agentic loops (cheap 1.25× writes that never
+# expire mid-loop); 1h survives long between-turn reading pauses, so follow-ups
+# read the cached prefix at 0.1× instead of re-writing it. Which wins is
+# workload-dependent — A/B the same flow under each and compare /usage's "saved".
+# An unknown value falls back to 5m. (Read once at import; set it in .env.)
+_CACHE_WRITE_PREMIUM_BY_TTL = {"5m": 0.25, "1h": 1.0}
+_env_cache_ttl = os.environ.get("LONGEVITYCLAW_CACHE_TTL", "5m").strip().lower()
+_CACHE_TTL = _env_cache_ttl if _env_cache_ttl in _CACHE_WRITE_PREMIUM_BY_TTL else "5m"
+CACHE_WRITE_PREMIUM = _CACHE_WRITE_PREMIUM_BY_TTL[_CACHE_TTL]
+CACHE_WRITE_MULTIPLIER = 1.0 + CACHE_WRITE_PREMIUM  # 1.25× (5m) or 2.0× (1h)
 
 
 class LongevityClawAgent:
@@ -194,6 +224,7 @@ class LongevityClawAgent:
             "models": {},   # model name -> {"input", "output", "calls"}
             "tools": {},    # tool name -> invocation count
             "skills": {},   # skill name -> run count
+            "cache": {"read": 0, "write": 0},  # cached input tokens (read ~0.1x)
         }
 
         # Effort: max tool calls per normal response (None = unlimited). Skills,
@@ -223,6 +254,15 @@ class LongevityClawAgent:
         )
         self.tools = get_tool_definitions()
         self.handlers = get_tool_handlers()
+
+        # Size the emergency trim threshold to THIS model's context window.
+        self.max_context_chars = self._resolve_context_budget()
+
+        # Provider gate for prompt caching: Anthropic models get explicit
+        # cache_control markers; everything else stays generic (relies on the
+        # provider's own automatic prefix caching, which our stable system prompt
+        # already enables). The prefix-stability discipline itself is agnostic.
+        self.provider = "anthropic" if self.model.lower().startswith("claude") else "generic"
         self.messages: list[dict] = []
         self.traces: list[dict] = []  # per-request trace log
 
@@ -251,6 +291,26 @@ class LongevityClawAgent:
         self.effort = level
         self.tool_budget = EFFORT_LEVELS[level]
         return True
+
+    def _resolve_context_budget(self) -> int:
+        """Chars of conversation to keep before the emergency trimmer fires,
+        sized to the model's real context window. Tries the live Models API
+        first (model-agnostic, authoritative), then a small known-models table
+        (prefix match, so dated ids resolve), then a conservative default."""
+        window = None
+        try:
+            window = getattr(self.client.models.retrieve(self.model),
+                             "max_input_tokens", None)
+        except Exception:
+            window = None
+        if not window:
+            for name, w in _KNOWN_CONTEXT_WINDOWS.items():
+                if self.model.startswith(name):
+                    window = w
+                    break
+        if not window:
+            window = DEFAULT_CONTEXT_WINDOW_TOKENS
+        return int(window * _CONTEXT_TRIM_FACTOR)
 
     def _fmt_tokens(self, n: int) -> str:
         if n >= 1000:
@@ -346,7 +406,7 @@ class LongevityClawAgent:
                     block["content"] = raw[:TOOL_RESULT_SUMMARY_LEN] + f"... [truncated, was {len(raw)} chars]"
 
         # Step 2: if still too large, drop oldest pairs (keep at least last 4 messages)
-        while len(self.messages) > 4 and self._estimate_chars(self.messages) > MAX_CONTEXT_CHARS:
+        while len(self.messages) > 4 and self._estimate_chars(self.messages) > self.max_context_chars:
             # Drop first two messages (user + assistant pair)
             if self.messages[0]["role"] == "user":
                 self.messages.pop(0)
@@ -361,6 +421,79 @@ class LongevityClawAgent:
                             self.messages.pop(0)
             else:
                 self.messages.pop(0)
+
+    # ── Prompt caching (provider-specific, isolated here) ──────────────────
+    # Anthropic block-level cache_control is robust across SDK versions (unlike
+    # the top-level kwarg, absent on older SDKs). Everything else is a no-op.
+    #
+    # TTL "5m" (not "1h") on purpose: our usage is write-heavy (agentic tool
+    # loops grow the conversation fast, so each round writes a delta that's read
+    # at most a few times). A 1h write costs 2× base; a 5m write costs 1.25×.
+    # When writes rival reads, the cheaper write wins — and the 5m window never
+    # expires mid-loop (rounds are seconds apart) and survives normal between-turn
+    # pauses. Only a >5min idle gap loses the cache, costing one full-price
+    # re-send before it re-caches. See CACHE_WRITE_PREMIUM below for the cost model.
+    _CACHE_CONTROL = {"type": "ephemeral", "ttl": _CACHE_TTL}
+
+    def _apply_prompt_cache(self, create_kwargs: dict) -> dict:
+        """Apply provider-specific prompt caching to a request, in place.
+
+        Anthropic: a cache_control breakpoint on the system block (anchors
+        tools+system) plus a rolling breakpoint on the last message (extends the
+        cache to the whole conversation prefix). Any other provider: untouched —
+        caching, if the provider has it, is automatic and only needs a stable
+        prefix, which we already maintain.
+        """
+        if self.provider != "anthropic":
+            return create_kwargs
+
+        system = create_kwargs.get("system")
+        if isinstance(system, str) and system:
+            create_kwargs["system"] = [{
+                "type": "text", "text": system, "cache_control": self._CACHE_CONTROL,
+            }]
+        create_kwargs["messages"] = self._messages_with_cache_breakpoint(
+            create_kwargs["messages"])
+        return create_kwargs
+
+    def _messages_with_cache_breakpoint(self, messages: list) -> list:
+        """Return messages with a cache_control breakpoint on the last message's
+        final content block (rolling cache of the conversation prefix). Builds a
+        shallow copy — never mutates the stored messages, so breakpoints don't
+        accumulate across rounds."""
+        if not messages:
+            return messages
+        last = messages[-1]
+        content = last.get("content")
+        if isinstance(content, str) and content:
+            new_content = [{"type": "text", "text": content,
+                            "cache_control": self._CACHE_CONTROL}]
+        elif isinstance(content, list) and content and isinstance(content[-1], dict):
+            new_content = content[:-1] + [{**content[-1],
+                                           "cache_control": self._CACHE_CONTROL}]
+        else:
+            return messages  # can't place a breakpoint here (e.g. SDK block objs)
+        return messages[:-1] + [{**last, "content": new_content}]
+
+    def _with_budget_note(self, messages: list, note: str) -> list:
+        """Append the effort/budget reminder as a text block on the LAST message,
+        on a shallow copy (never mutates stored messages). Keeping this volatile
+        text in the rolling tail — not the system block — means changing /effort or
+        toggling the skill cap leaves the cached system+history prefix byte-stable.
+        Provider-agnostic: runs for every backend, independent of cache markers."""
+        if not messages or not note:
+            return messages
+        last = messages[-1]
+        content = last.get("content")
+        note_block = {"type": "text", "text": note}
+        if isinstance(content, str):
+            new_content = ([{"type": "text", "text": content}, note_block]
+                           if content else [note_block])
+        elif isinstance(content, list):
+            new_content = content + [note_block]
+        else:
+            return messages  # unexpected shape — leave it untouched
+        return messages[:-1] + [{**last, "content": new_content}]
 
     def chat(self, user_message: str) -> str:
         self.messages.append({"role": "user", "content": user_message})
@@ -413,38 +546,45 @@ class LongevityClawAgent:
             memory_context = memory.get_context_prompt()
             system_prompt = SYSTEM_PROMPT + memory_context if memory_context else SYSTEM_PROMPT
 
-            # Effort cap: tell the model its tool-call budget up front (and the
-            # live remaining count) so it PLANS within it, rather than only being
-            # truncated after the fact. When the budget is spent, withhold tools
-            # so it answers with what it has. Skills lift the cap entirely.
+            # Build the request provider-neutrally (plain string system, plain
+            # messages). Provider-specific prompt caching is applied by the single
+            # gated hook _apply_prompt_cache() just before the call.
             create_kwargs = {
                 "model": self.model,
                 "max_tokens": 16384,
                 "messages": self.messages,
             }
+            # Effort cap: state the per-response tool budget as text the model
+            # self-counts against (the hard cap is still enforced by the mid-round
+            # stub in the tool loop). Skills lift the cap entirely.
+            #
+            # The note lives in the rolling MESSAGE tail, never in the system block:
+            # its text changes with /effort and toggles on/off per skill, and the
+            # system block anchors the whole cached prefix — so putting it there
+            # would invalidate tools+system+history on every effort change or skill
+            # call. In the tail (rewritten each round anyway) it costs ~nothing and
+            # keeps the cached prefix byte-stable. This discipline is provider-
+            # agnostic; it helps any backend's prefix cache.
             capped = self.tool_budget is not None and not self._skill_invoked
-            if not capped:
-                create_kwargs["tools"] = self.tools
-            else:
-                remaining = self.tool_budget - len(self._tools_called)
-                if remaining > 0:
+            budget_note = ""
+            if capped:
+                budget_note = (
+                    f"TOOL-CALL BUDGET: limit this response to {self.tool_budget} tool "
+                    f"call(s) total (effort '{self.effort}'). Count the tool calls you have "
+                    f"already made in this response and stop before exceeding the budget; pick "
+                    f"the most informative tools first. Running a saved skill lifts this cap."
+                )
+                if self.tool_budget - len(self._tools_called) > 0:
                     create_kwargs["tools"] = self.tools
-                    system_prompt += (
-                        f"\n\nTOOL-CALL BUDGET: This response is limited to "
-                        f"{self.tool_budget} tool call(s) total (effort '{self.effort}'); "
-                        f"{len(self._tools_called)} used, {remaining} remaining. Plan to fully "
-                        f"answer within this budget — pick the most informative tools first, "
-                        f"batch what you can, and do not assume you can make more than "
-                        f"{remaining} further call(s). (Running a saved skill lifts this cap.)"
-                    )
-                else:  # budget spent — withhold tools, answer now
-                    system_prompt += (
-                        f"\n\nTOOL-CALL BUDGET REACHED ({self.tool_budget} calls, effort "
-                        f"'{self.effort}'). Do not request more tools — answer now with the "
-                        f"information already gathered; if something could not be completed, "
-                        f"say so briefly."
-                    )
+                # else: budget spent → withhold tools so the model answers with what it has
+            else:
+                create_kwargs["tools"] = self.tools
             create_kwargs["system"] = system_prompt
+            create_kwargs["messages"] = self._with_budget_note(
+                create_kwargs["messages"], budget_note)
+
+            # Provider-specific prompt caching (no-op for non-Anthropic models).
+            self._apply_prompt_cache(create_kwargs)
 
             t0 = time.time()
             response = self.client.messages.create(**create_kwargs)
@@ -454,13 +594,25 @@ class LongevityClawAgent:
             # Track tokens
             self._total_api_time += elapsed
             if hasattr(response, "usage") and response.usage:
-                self._total_input_tokens += response.usage.input_tokens
+                # NOTE: usage.input_tokens is the UNCACHED remainder only; cached
+                # tokens are reported separately (absent on backends without
+                # caching, hence getattr). True input = input + read + write — and
+                # under aggressive caching input_tokens collapses to ~single digits,
+                # so the status-bar "↑" must use the true total or it reads near 0.
+                cr = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+                cw = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+                self._total_input_tokens += response.usage.input_tokens + cr + cw
                 self._total_output_tokens += response.usage.output_tokens
                 m = self.session_usage["models"].setdefault(
-                    self.model, {"input": 0, "output": 0, "calls": 0})
+                    self.model, {"input": 0, "output": 0, "calls": 0,
+                                 "cache_read": 0, "cache_write": 0})
                 m["input"] += response.usage.input_tokens
                 m["output"] += response.usage.output_tokens
                 m["calls"] += 1
+                m["cache_read"] += cr
+                m["cache_write"] += cw
+                self.session_usage["cache"]["read"] += cr
+                self.session_usage["cache"]["write"] += cw
 
             self.on_status(f"got response ({elapsed:.1f}s, {self._fmt_tokens(response.usage.output_tokens if response.usage else 0)} tokens)")
             self._update_stats()
