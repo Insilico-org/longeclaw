@@ -18,13 +18,13 @@ from typing import Any
 import httpx
 
 
-# HuggingFace configuration (from environment with defaults)
-HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://swchnq0ekc3scmqw.us-east-2.aws.endpoints.huggingface.cloud")
+# HuggingFace configuration
+HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://lllmurl.us-east-2.aws.endpoints.huggingface.cloud")
 HF_MODEL = os.environ.get("HF_MODEL", "longevity-llm")
 
 # Local vLLM configuration (from environment)
 VLLM_ENDPOINT = os.environ.get("VLLM_ENDPOINT")  # Required for local vLLM
-VLLM_MODEL = os.environ.get("VLLM_MODEL", "peachy")
+VLLM_MODEL = os.environ.get("VLLM_MODEL", "longevity-llm-local")
 
 # Backend selection: "hf" (default) or "local"
 LLM_BACKEND = os.environ.get("LLM_BACKEND", "hf").lower()
@@ -76,6 +76,14 @@ def get_hf_token() -> str:
     if not token:
         raise ValueError("HF_TOKEN environment variable not set")
     return token
+
+
+def get_hf_endpoint() -> str:
+    """Get HuggingFace endpoint from environment (re-read for runtime switching)."""
+    endpoint = os.environ.get("HF_ENDPOINT", HF_ENDPOINT)
+    if not endpoint:
+        raise ValueError("HF_ENDPOINT environment variable not set")
+    return endpoint
 
 
 def get_vllm_api_key() -> str:
@@ -155,6 +163,7 @@ def _query_hf(
 ) -> LLMResponse:
     """Query HuggingFace endpoint."""
     token = get_hf_token()
+    endpoint = get_hf_endpoint()
 
     messages: list[dict[str, str]] = []
     if system_prompt:
@@ -176,7 +185,7 @@ def _query_hf(
 
     with httpx.Client(timeout=httpx.Timeout(timeout, connect=5.0)) as client:
         response = client.post(
-            f"{HF_ENDPOINT}/v1/chat/completions",
+            f"{endpoint}/v1/chat/completions",
             json=payload,
             headers=headers,
         )
