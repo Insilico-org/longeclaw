@@ -724,35 +724,44 @@ def _run_loop(agent, task: str, interval: int, status, stream_enabled: bool):
 
 
 def _stream_response(response: str):
-    """Render response progressively inside a panel, simulating streaming.
+    """Pseudo-stream the first part of the answer, then print the whole thing
+    at once.
 
-    Short responses stream entirely word-by-word inside a Live panel.
-    Long responses stream the first screen-worth, then complete instantly
-    with the full panel (natural terminal scrolling).
+    Short answers stream word-by-word in full. Long answers stream only a brief
+    first window — kept small and clear of the screen edge — then complete
+    instantly with the full panel. Keeping the streamed region small avoids the
+    flicker that tall Live regions cause near the bottom of the screen, and the
+    line/time caps stop a long answer from streaming forever.
     """
+    # console.size can mis-report right after a prompt_toolkit app closes; clamp
+    # it so a bad reading can't disable the long-answer cutoff.
     term_h = console.size.height
+    if not (8 <= term_h <= 400):
+        term_h = 30
     usable_w = max(console.size.width - 8, 40)
-    stream_limit = term_h - 6
-    est_total = sum(1 + len(line) // usable_w for line in response.split("\n")) + 6
-    is_long = est_total > stream_limit
+
+    def _wrapped(text: str) -> int:
+        return sum(1 + len(ln) // usable_w for ln in text.split("\n"))
+
+    # Stream at most a small window: never near the screen edge, never huge.
+    stream_lines = max(6, min(term_h - 8, 16))
+    is_long = _wrapped(response) > stream_lines
 
     words = response.split(" ")
     shown = ""
     chunk_size = 1
+    t0 = time.time()
 
     with Live(
         _make_panel(Markdown("")),
-        console=console, refresh_per_second=24,
+        console=console, refresh_per_second=20,
         transient=is_long,
     ) as live:
         i = 0
         while i < len(words):
-            batch = words[i:i + chunk_size]
-            shown += " ".join(batch) + " "
-            if is_long:
-                est_lines = sum(1 + len(ln) // usable_w for ln in shown.split("\n")) + 6
-                if est_lines > stream_limit:
-                    break
+            shown += " ".join(words[i:i + chunk_size]) + " "
+            if is_long and (_wrapped(shown) >= stream_lines or time.time() - t0 > 1.5):
+                break
             live.update(_make_panel(Markdown(shown)))
             i += chunk_size
             chunk_size = random.randint(1, 4)
@@ -821,47 +830,43 @@ def _chat_with_typeahead(agent, user_input, session, status_text):
         suffix = "next queued ✓ · Esc to interrupt" if queued else "Esc to interrupt"
         return f"{frame} {line}    {suffix}"
 
-    # The type-ahead prompts leave no echo (erase_when_done): a queued message
-    # is shown explicitly right before its answer instead, keeping the chat in
-    # order. Stay interactive the WHOLE time the model works (animated status bar
-    # + Esc-to-interrupt); a submitted follow-up is stored in `queued` and the
-    # prompt reopens empty, so it can't be lost by editing/clearing the buffer.
-    session.app.erase_when_done = True
-    try:
-        while worker.is_alive():
-            try:
-                entered = session.prompt(
-                    _make_chrome(_live_bar, tip),
-                    refresh_interval=0.5,
-                )
-            except (KeyboardInterrupt, EOFError):
-                agent.request_cancel()   # cooperative cancel; stay interactive
-                continue
+    # The prompts leave no echo (the session uses erase_when_done): a queued
+    # message is shown explicitly right before its answer instead, keeping the
+    # chat ordered. Stay interactive the WHOLE time the model works (animated
+    # status bar + Esc-to-interrupt); a submitted follow-up is stored in `queued`
+    # and the prompt reopens empty, so it can't be lost by editing/clearing.
+    while worker.is_alive():
+        try:
+            entered = session.prompt(
+                _make_chrome(_live_bar, tip),
+                refresh_interval=0.5,
+            )
+        except (KeyboardInterrupt, EOFError):
+            agent.request_cancel()   # cooperative cancel; stay interactive
+            continue
 
-            if by_worker["flag"]:
-                tail = entered           # worker finished; this is an unsent draft
-                break
+        if by_worker["flag"]:
+            tail = entered           # worker finished; this is an unsent draft
+            break
 
-            if entered.strip().lower() in ("/empty_queue", "/empty-queue"):
-                console.print(f"  [{C_DARK}]queue cleared[/{C_DARK}]" if queued
-                              else f"  [{C_DARK}]nothing queued[/{C_DARK}]")
-                queued = None
-                continue
+        if entered.strip().lower() in ("/empty_queue", "/empty-queue"):
+            console.print(f"  [{C_DARK}]queue cleared[/{C_DARK}]" if queued
+                          else f"  [{C_DARK}]nothing queued[/{C_DARK}]")
+            queued = None
+            continue
 
-            if entered.strip():          # Enter while busy → queue it, reopen empty
-                queued = entered.strip()
-                if not notified:
-                    console.print(f"  [{C_DARK}]↩ queued — sent once the current answer "
-                                  f"is ready[/{C_DARK}]")
-                    notified = True
-                # First queue this session: surface how to cancel it, in the tip row.
-                if not _queue_tip_shown:
-                    tip = _QUEUE_TIP
-                    _queue_tip_shown = True
+        if entered.strip():          # Enter while busy → queue it, reopen empty
+            queued = entered.strip()
+            if not notified:
+                console.print(f"  [{C_DARK}]↩ queued — sent once the current answer "
+                              f"is ready[/{C_DARK}]")
+                notified = True
+            # First queue this session: surface how to cancel it, in the tip row.
+            if not _queue_tip_shown:
+                tip = _QUEUE_TIP
+                _queue_tip_shown = True
 
-        worker.join()  # near-instant: worker has finished or is closing the prompt
-    finally:
-        session.app.erase_when_done = False
+    worker.join()  # near-instant: worker has finished or is closing the prompt
     if agent.is_cancelled():
         return holder.get("resp"), holder.get("err"), "", False, True
     if queued:
@@ -1104,6 +1109,10 @@ def main():
         complete_while_typing=True,
         key_bindings=kb,
         input_processors=[PasteCollapseProcessor()],
+        # Keep the input area "locked": every prompt erases its rendered chrome
+        # (bar + tip + input) on submit, so the separator never piles up in the
+        # scrollback. The submitted message is echoed as a plain "you> …" line.
+        erase_when_done=True,
         style=PTStyle.from_dict({
             "prompt": f"bold {C_MID}",
             "completion-menu": f"bg:#0a1a1e {C_MID}",
@@ -1125,12 +1134,10 @@ def main():
     while True:
         try:
             console.print()
+            demo_echoed = False
             if pending is not None:
                 user_input = pending
                 pending = None
-                # Show the queued question right before its answer (the type-ahead
-                # prompt that captured it erased itself), keeping the chat ordered.
-                console.print(f"[bold {C_MID}]you>[/bold {C_MID}] {user_input}")
             elif demo_queue:
                 demo_text = demo_queue.pop(0)
                 sys.stdout.write(f"\033[1;38;2;59;193;168myou>\033[0m ")
@@ -1143,6 +1150,7 @@ def main():
                 sys.stdout.write("\n")
                 sys.stdout.flush()
                 user_input = demo_text
+                demo_echoed = True
             else:
                 user_input = session.prompt(
                     _make_chrome(_idle_bar_text, _pick_tip()),
@@ -1166,6 +1174,12 @@ def main():
 
         if not user_input:
             continue
+
+        # The prompt erased its own chrome — echo the message into the scrollback
+        # as a plain "you> …" line so the history stays clean and ordered. (Demo
+        # mode already printed it via the typing animation.)
+        if not demo_echoed:
+            console.print(f"[bold {C_MID}]you>[/bold {C_MID}] {user_input}")
 
         # ── Handle slash commands ──────────────────────────────────
         if user_input.startswith("/"):
