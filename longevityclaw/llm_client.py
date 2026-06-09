@@ -32,6 +32,33 @@ LLM_BACKEND = os.environ.get("LLM_BACKEND", "hf").lower()
 DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TEMPERATURE = 0.7
 
+# Session-cumulative L-LLM usage, surfaced by the CLI's /usage command. Counts
+# every call routed through query_llm (the direct tool plus internal callers).
+_LLM_STATS: dict[str, Any] = {"calls": 0, "input": 0, "output": 0, "by_model": {}}
+
+
+def get_llm_stats() -> dict:
+    """Return a copy of session-cumulative L-LLM usage."""
+    return {
+        "calls": _LLM_STATS["calls"],
+        "input": _LLM_STATS["input"],
+        "output": _LLM_STATS["output"],
+        "by_model": dict(_LLM_STATS["by_model"]),
+    }
+
+
+def reset_llm_stats() -> None:
+    _LLM_STATS.update(calls=0, input=0, output=0, by_model={})
+
+
+def _record_llm_call(resp: "LLMResponse") -> None:
+    _LLM_STATS["calls"] += 1
+    usage = getattr(resp, "usage", None) or {}
+    _LLM_STATS["input"] += usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
+    _LLM_STATS["output"] += usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
+    model = getattr(resp, "model", None) or "L-LLM"
+    _LLM_STATS["by_model"][model] = _LLM_STATS["by_model"].get(model, 0) + 1
+
 
 @dataclass(frozen=True)
 class LLMResponse:
@@ -97,7 +124,7 @@ def query_llm(
     use_backend = backend if backend else get_current_backend()
 
     if use_backend == "local":
-        return _query_vllm(
+        resp = _query_vllm(
             prompt,
             system_prompt=system_prompt,
             max_tokens=max_tokens,
@@ -105,7 +132,7 @@ def query_llm(
             timeout=timeout,
         )
     else:
-        return _query_hf(
+        resp = _query_hf(
             prompt,
             system_prompt=system_prompt,
             max_tokens=max_tokens,
@@ -113,6 +140,8 @@ def query_llm(
             enable_thinking=enable_thinking,
             timeout=timeout,
         )
+    _record_llm_call(resp)
+    return resp
 
 
 def _query_hf(
@@ -145,7 +174,7 @@ def _query_hf(
         "Content-Type": "application/json",
     }
 
-    with httpx.Client(timeout=timeout) as client:
+    with httpx.Client(timeout=httpx.Timeout(timeout, connect=5.0)) as client:
         response = client.post(
             f"{HF_ENDPOINT}/v1/chat/completions",
             json=payload,
@@ -193,7 +222,7 @@ def _query_vllm(
         "Content-Type": "application/json",
     }
 
-    with httpx.Client(timeout=timeout) as client:
+    with httpx.Client(timeout=httpx.Timeout(timeout, connect=5.0)) as client:
         response = client.post(
             f"{endpoint}/v1/chat/completions",
             json=payload,

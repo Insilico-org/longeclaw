@@ -57,6 +57,10 @@ Three population-scale datasets for individual interpretation (z-scores, percent
 
 **PubMed search.** Search biomedical literature directly from the conversation via NCBI E-utilities.
 
+**Workspace files.** Read text files, and -- in the local CLI -- write and edit files to save reports or exports. By default access is confined to two folders: `workspace/` (where relative paths resolve) and `skills/`. Grant the agent access to other locations on demand with `/grant <path>` (or set `LONGEVITYCLAW_ALLOWED`). The policy is configurable (`readwrite` / `readonly` / `off`); the hosted web app runs with filesystem tools disabled.
+
+**Skills.** Save a procedure you just ran as a named, reusable skill, then replay it later by typing `/<skill-name>`. Skills are stored as `skills/<name>/SKILL.md` and are prompt recipes -- replaying one re-runs the steps against fresh inputs.
+
 ## Scientific Analysis Modules
 
 Three new research modules for longevity biology analysis:
@@ -125,7 +129,7 @@ you> discover targets for inflammation and senescence       # specific hallmarks
 you> find novel druggable targets in mitochondrial dysfunction
 ```
 
-**Tool:** `discover_novel_targets` with parameters:
+**Tool:** `discover_targets` with parameters:
 - `hallmarks` — list of hallmarks to analyze (default: all 14)
 - `num_runs` — generation runs for consensus (default: 1)
 - `parallel` — enable parallel processing (default: true)
@@ -300,9 +304,11 @@ you> what role does g@FOXO3 play in aging?
 you> train a model on inflammatory response genes in blood
 ```
 
-Autocomplete: `@` for file paths, `g@` for gene names, `cl@` for clock names, `/` for commands.
+Autocomplete: `@` for file paths, `g@` for gene names, `cl@` for clock names, `/` for commands and saved skills.
 
-Commands: `/help`, `/clocks`, `/save`, `/showwhy` (agent reasoning trace), `/clear`, `/model`, `/quit`.
+Commands: `/help`, `/clocks`, `/skills`, `/allowed`, `/grant <path>`, `/loop [freq] <task>`, `/save`, `/showwhy` (agent reasoning trace), `/clear`, `/model`, `/quit`. Invoke a saved skill with `/<skill-name>`. `/loop` repeats a request on a timer (e.g. `/loop 30m check PubMed for new GrimAge papers`) until Ctrl-C.
+
+**Type-ahead:** while the agent is working on your question, you can start typing the next one -- it is held and sent automatically once the current answer is rendered, so you never have to wait on the model to compose a follow-up. Press **Esc** (or Ctrl-C) to interrupt a running request; it stops at the next step and shows "Interrupted by user".
 
 ## Configuration
 

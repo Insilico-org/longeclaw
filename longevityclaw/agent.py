@@ -41,6 +41,10 @@ You can also search **PubMed** for biomedical literature — use this when users
 
 You have access to **genomic annotation tools**: look up CpG sites by ID, chromosome, gene, or regulatory region (promoter, body, enhancer, CpG island); query authoritative gene function, GO terms, and Reactome pathways from MyGene.info; and run **Gene Set Enrichment Analysis** (preranked GSEA) on ranked feature lists against MSigDB collections (50 hallmark pathways, 1787 Reactome, 658 KEGG, 1006 cancer gene sets).
 
+You also have **workspace file tools**: read_file and list_dir to read text files (a notes file, a script, a data file you want to inspect as text — not only omics CSVs); write_file and edit_file to save reports, exports, or scripts. By default file access is confined to two directories — the workspace/ folder (where relative paths resolve) and the skills/ folder. If a path is outside these, the tool refuses it and names the allowed directories: do NOT retry the same path — instead tell the user the location is not accessible and that they can grant access with "/grant <path>". Likewise, if a write is refused because the policy is read-only or off, say so rather than retrying. For running aging clocks on an omics CSV, still use predict_age_from_file (not read_file).
+
+You can also create and replay **skills** — reusable procedures the user can invoke by name. When the user asks to "save this as a skill", "remember how to do this", or "make this repeatable", call save_skill with generalized step-by-step instructions (refer to the tools and inputs each step needs, not a transcript of one specific run). Use list_skills to show saved skills and run_skill to load and follow a skill's instructions when the user invokes it (e.g. types /skill-name).
+
 ## Your Capabilities
 1. **Clock encyclopedia**: Explain any clock -- what it measures, how it works, its key features, its strengths and limitations, and the original publication.
 2. **Feature deep-dive**: Look up any CpG site, gene, or protein across all clocks. Explain its role in aging and which clocks weight it most heavily.
@@ -131,8 +135,15 @@ TOOL_LABELS = {
     "forget": "forgetting user info",
     "recall": "recalling user memory",
     "query_longevity_llm": "querying L-LLM (Longevity LLM)",
-    "discover_novel_targets": "discovering novel targets (6D scoring)",
+    "discover_targets": "discovering novel targets (6D scoring)",
     "validate_targets": "validating targets via OpenTargets",
+    "read_file": "reading file",
+    "list_dir": "listing directory",
+    "write_file": "writing file",
+    "edit_file": "editing file",
+    "save_skill": "saving skill",
+    "list_skills": "listing skills",
+    "run_skill": "running skill",
 }
 
 
@@ -167,6 +178,19 @@ class LongevityClawAgent:
         self._timer_thread: threading.Thread | None = None
         self._timer_running = False
 
+        # Cooperative cancellation: chat() runs in a worker thread under the CLI's
+        # type-ahead, so SIGINT can't reach it. The UI sets this event (Ctrl-C/Esc)
+        # and chat() returns at the next round boundary instead of blocking.
+        self._cancel = threading.Event()
+        self._generating = False
+
+        # Session-cumulative usage (for /usage), never reset between chat() calls.
+        self.session_usage = {
+            "models": {},   # model name -> {"input", "output", "calls"}
+            "tools": {},    # tool name -> invocation count
+            "skills": {},   # skill name -> run count
+        }
+
         kwargs = {}
         foundry_endpoint = os.environ.get("ANTHROPIC_FOUNDRY_ENDPOINT")
         foundry_key = os.environ.get("ANTHROPIC_FOUNDRY_API_KEY")
@@ -193,6 +217,18 @@ class LongevityClawAgent:
         self.on_status("loading clock database (233 clocks, 429K coefficients)...")
         get_db()
         self.on_status("ready")
+
+    def request_cancel(self):
+        """Signal the running chat() to stop at the next round boundary."""
+        self._cancel.set()
+
+    def is_generating(self) -> bool:
+        """True while a chat() call is in flight."""
+        return self._generating
+
+    def is_cancelled(self) -> bool:
+        """True if the most recent chat() was cancelled (until the next call)."""
+        return self._cancel.is_set()
 
     def _fmt_tokens(self, n: int) -> str:
         if n >= 1000:
@@ -314,6 +350,8 @@ class LongevityClawAgent:
         self._total_tool_time = 0.0
         self._tools_called = []
         self._clocks_computed = 0
+        self._cancel.clear()
+        self._generating = True
 
         # Trace for this request
         trace = {
@@ -329,6 +367,20 @@ class LongevityClawAgent:
         iteration = 0
         while True:
             iteration += 1
+
+            # Cooperative cancellation point (set by the UI on Ctrl-C / Esc).
+            if self._cancel.is_set():
+                self._stop_thinking_timer()
+                self._generating = False
+                final = "_(interrupted — stopped before completing.)_"
+                trace["final_response"] = final
+                trace["total_input_tokens"] = self._total_input_tokens
+                trace["total_output_tokens"] = self._total_output_tokens
+                trace["total_time"] = self._total_api_time + self._total_tool_time
+                self.traces.append(trace)
+                self.on_status("interrupted")
+                return final
+
             think_label = "thinking" if iteration == 1 else f"thinking (round {iteration})"
             self._manage_context()
             self._start_thinking_timer(think_label)
@@ -354,6 +406,11 @@ class LongevityClawAgent:
             if hasattr(response, "usage") and response.usage:
                 self._total_input_tokens += response.usage.input_tokens
                 self._total_output_tokens += response.usage.output_tokens
+                m = self.session_usage["models"].setdefault(
+                    self.model, {"input": 0, "output": 0, "calls": 0})
+                m["input"] += response.usage.input_tokens
+                m["output"] += response.usage.output_tokens
+                m["calls"] += 1
 
             self.on_status(f"got response ({elapsed:.1f}s, {self._fmt_tokens(response.usage.output_tokens if response.usage else 0)} tokens)")
             self._update_stats()
@@ -390,6 +447,7 @@ class LongevityClawAgent:
 
                 self.on_status(f"done ({self._total_api_time:.1f}s)")
                 self._update_stats()
+                self._generating = False
                 return final
 
             # Handle tool calls
@@ -402,10 +460,12 @@ class LongevityClawAgent:
                     continue
 
                 label = TOOL_LABELS.get(block.name, block.name)
-                if n_tools > 1:
-                    self.on_status(f"[{i+1}/{n_tools}] {label}...")
-                else:
-                    self.on_status(f"{label}...")
+                # Surface the target path for file operations.
+                if block.name in ("read_file", "write_file", "edit_file", "list_dir"):
+                    target = block.input.get("file_path") or block.input.get("dir_path")
+                    if target:
+                        label = f"{label}: {target}"
+                prefix = f"[{i+1}/{n_tools}] " if n_tools > 1 else ""
 
                 handler = self.handlers.get(block.name)
                 if handler:
@@ -417,9 +477,13 @@ class LongevityClawAgent:
                         if block.name in ("train_hallmark_model", "train_custom_model"):
                             set_train_progress(self.on_detail)
 
+                        # Keep the status alive with an elapsed counter while the
+                        # tool runs (some calls — L-LLM, OpenTargets — are slow).
+                        self._start_thinking_timer(f"{prefix}{label}")
                         t1 = time.time()
                         result = handler(**block.input)
                         dt = time.time() - t1
+                        self._stop_thinking_timer()
 
                         set_predict_progress(None)
                         set_individual_progress(None)
@@ -428,8 +492,14 @@ class LongevityClawAgent:
 
                         self._total_tool_time += dt
                         self._tools_called.append(block.name)
+                        self.session_usage["tools"][block.name] = (
+                            self.session_usage["tools"].get(block.name, 0) + 1)
+                        if block.name == "run_skill":
+                            sk = block.input.get("name", "?")
+                            self.session_usage["skills"][sk] = (
+                                self.session_usage["skills"].get(sk, 0) + 1)
 
-                        self.on_status(f"{label} ({dt:.1f}s)")
+                        self.on_status(f"{prefix}{label} ({dt:.1f}s)")
                         self._update_stats()
 
                         result_json = json.dumps(result, default=str)
@@ -447,6 +517,7 @@ class LongevityClawAgent:
                             "content": result_json,
                         })
                     except Exception as e:
+                        self._stop_thinking_timer()
                         set_predict_progress(None)
                         set_individual_progress(None)
                         set_train_progress(None)
@@ -484,6 +555,7 @@ class LongevityClawAgent:
                 self.messages.append({"role": "user", "content": tool_results})
             else:
                 # No tool results to send back — return any text we have
+                self._generating = False
                 return "\n".join(text_parts) if text_parts else "(no response)"
 
     def _on_clock_progress(self, msg: str):

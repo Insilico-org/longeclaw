@@ -153,6 +153,8 @@ async def auth(sid, data):
     env["COLORTERM"] = "truecolor"
     env["COLUMNS"] = "120"
     env["LINES"] = "40"
+    # Hosted, multi-user context: disable agent filesystem tools entirely.
+    env["LONGEVITYCLAW_FS"] = "off"
     if token:
         env["LONGEVITYCLAW_SESSION_ID"] = token
 
