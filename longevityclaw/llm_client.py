@@ -1,16 +1,22 @@
 """
 L-LLM (Longevity LLM) client for aging biology queries.
 
-Provides integration with the L-LLM model deployed on HuggingFace Inference Endpoints
-or local vLLM server.
+Talks to the longevity model over an OpenAI-compatible chat API. Three backends:
 
-Backends:
-- HuggingFace (default): Set HF_TOKEN env var
-- Local vLLM: Set LLM_BACKEND=local, VLLM_ENDPOINT, VLLM_API_KEY
+- HuggingFace Inference Endpoint (default): LLM_BACKEND=hf, set HF_TOKEN
+- Self-hosted vLLM (bf16 official weights): LLM_BACKEND=local, LOCAL_ENGINE=vllm
+- Self-hosted llama.cpp (GGUF quant):       LLM_BACKEND=local, LOCAL_ENGINE=llamacpp
+
+The two self-hosted engines speak the same protocol but differ in one place that
+matters here: how reasoning ("thinking") is switched off. vLLM honours the nested
+``chat_template_kwargs.enable_thinking`` flag; llama.cpp ignores it and instead
+respects the Qwen ``/no_think`` soft switch appended to the user turn. The local
+query path picks the right lever from LOCAL_ENGINE.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -22,12 +28,28 @@ import httpx
 HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://lllmurl.us-east-2.aws.endpoints.huggingface.cloud")
 HF_MODEL = os.environ.get("HF_MODEL", "longevity-llm")
 
-# Local vLLM configuration (from environment)
-VLLM_ENDPOINT = os.environ.get("VLLM_ENDPOINT")  # Required for local vLLM
-VLLM_MODEL = os.environ.get("VLLM_MODEL", "longevity-llm-local")
+# Self-hosted backend (vLLM or llama.cpp). Endpoint/model are re-read at call
+# time for runtime switching; these module constants are the fallbacks.
+VLLM_ENDPOINT = os.environ.get("VLLM_ENDPOINT") or os.environ.get("LOCAL_ENDPOINT")
+VLLM_MODEL = os.environ.get("VLLM_MODEL", "longevity-llm")
 
-# Backend selection: "hf" (default) or "local"
+# Backend selection: "hf" (default) or a local engine (see _LOCAL_BACKENDS).
 LLM_BACKEND = os.environ.get("LLM_BACKEND", "hf").lower()
+
+# Self-hosted engine for the local backend: "vllm" (default) or "llamacpp".
+LOCAL_ENGINE = os.environ.get("LOCAL_ENGINE", "vllm").lower()
+
+# LLM_BACKEND values that mean "self-hosted". "vllm"/"llamacpp" double as engine
+# shorthands (they pin the engine); "local" defers the engine to LOCAL_ENGINE.
+_LOCAL_BACKENDS = {"local", "vllm", "llamacpp", "llama.cpp", "llama_cpp", "gguf"}
+_ENGINE_ALIASES = {"llama.cpp": "llamacpp", "llama_cpp": "llamacpp", "gguf": "llamacpp"}
+
+# Per-engine default sampling extras. A repetition penalty > 1.0 is not optional:
+# the model loops at 1.0 (167-response sweep). llama.cpp spells it repeat_penalty.
+_ENGINE_DEFAULT_EXTRA = {
+    "vllm": {"repetition_penalty": 1.1},
+    "llamacpp": {"repeat_penalty": 1.1},
+}
 
 DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TEMPERATURE = 0.7
@@ -87,16 +109,78 @@ def get_hf_endpoint() -> str:
 
 
 def get_vllm_api_key() -> str:
-    """Get vLLM API key from environment."""
-    key = os.environ.get("VLLM_API_KEY")
-    if not key:
-        raise ValueError("VLLM_API_KEY environment variable not set")
-    return key
+    """Bearer token for the local server.
+
+    Optional — self-hosted vLLM/llama.cpp usually ignore it, and the OpenAI-style
+    clients still want a non-empty string, so default to a placeholder rather than
+    raising. Set VLLM_API_KEY only when the server was started with --api-key.
+    """
+    return os.environ.get("VLLM_API_KEY") or "none"
 
 
 def get_current_backend() -> str:
-    """Get current LLM backend (re-read from env for runtime switching)."""
+    """Current LLM backend (re-read from env for runtime switching)."""
     return os.environ.get("LLM_BACKEND", "hf").lower()
+
+
+def is_local_backend(backend: str | None = None) -> bool:
+    """True when *backend* (or the configured one) is a self-hosted engine."""
+    return (backend or get_current_backend()).lower() in _LOCAL_BACKENDS
+
+
+def _normalize_engine(name: str) -> str:
+    """Canonical engine name: 'vllm' or 'llamacpp'."""
+    n = (name or "vllm").lower()
+    n = _ENGINE_ALIASES.get(n, n)
+    return n if n in _ENGINE_DEFAULT_EXTRA else "vllm"
+
+
+def get_local_engine(backend: str | None = None) -> str:
+    """Resolve the self-hosted engine.
+
+    A backend that names an engine ("vllm"/"llamacpp") pins it; the generic
+    "local" defers to the LOCAL_ENGINE env var.
+    """
+    b = (backend or get_current_backend()).lower()
+    if b in _ENGINE_DEFAULT_EXTRA or b in _ENGINE_ALIASES:
+        return _normalize_engine(b)
+    return _normalize_engine(os.environ.get("LOCAL_ENGINE", LOCAL_ENGINE))
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursive dict merge so nested objects (e.g. chat_template_kwargs) combine
+    rather than overwrite."""
+    return base | {
+        k: _deep_merge(base[k], v)
+        if isinstance(v, dict) and isinstance(base.get(k), dict) else v
+        for k, v in override.items()
+    }
+
+
+def _local_extra_body(engine: str) -> dict:
+    """Sampling extras for a local request: per-engine defaults overlaid with the
+    optional LOCAL_EXTRA_BODY JSON override (e.g. '{"top_p": 0.8, "top_k": 20}')."""
+    extra = dict(_ENGINE_DEFAULT_EXTRA[engine])
+    if raw := os.environ.get("LOCAL_EXTRA_BODY"):
+        try:
+            extra = _deep_merge(extra, json.loads(raw))
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return extra
+
+
+def _strip_thinking(content: str) -> str:
+    """Remove a chain-of-thought preamble the model may prepend.
+
+    The official vLLM container pre-opens ``<think>`` and runs with no reasoning
+    parser, so the trace arrives inside ``message.content`` terminated by a bare
+    ``</think>`` (interface-contract layout C). Split on it; otherwise return the
+    content untouched. (The GGUF on llama.cpp emits an untagged "Thinking
+    Process:" ramble with no delimiter — suppressed via /no_think, not stripped.)
+    """
+    if content and "</think>" in content:
+        return content.split("</think>")[-1].strip()
+    return content.strip() if content else content
 
 
 def query_llm(
@@ -119,7 +203,8 @@ def query_llm(
         temperature: Sampling temperature (0.0-1.0).
         enable_thinking: Enable extended thinking mode (increases latency).
         timeout: Request timeout in seconds.
-        backend: Override backend ("hf" or "local"). If None, uses LLM_BACKEND env.
+        backend: Override backend ("hf", "local", "vllm", or "llamacpp"). If None,
+            uses the LLM_BACKEND env var.
 
     Returns:
         LLMResponse with content and metadata.
@@ -129,14 +214,16 @@ def query_llm(
         ValueError: If required token/key not set.
     """
     # Determine backend
-    use_backend = backend if backend else get_current_backend()
+    use_backend = (backend or get_current_backend()).lower()
 
-    if use_backend == "local":
-        resp = _query_vllm(
+    if is_local_backend(use_backend):
+        resp = _query_local(
             prompt,
             system_prompt=system_prompt,
             max_tokens=max_tokens,
             temperature=temperature,
+            enable_thinking=enable_thinking,
+            engine=get_local_engine(use_backend),
             timeout=timeout,
         )
     else:
@@ -201,29 +288,50 @@ def _query_hf(
     )
 
 
-def _query_vllm(
+def _query_local(
     prompt: str,
     *,
     system_prompt: str | None = None,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float = DEFAULT_TEMPERATURE,
+    enable_thinking: bool = False,
+    engine: str = "vllm",
     timeout: float = 120.0,
 ) -> LLMResponse:
-    """Query local vLLM server."""
-    api_key = get_vllm_api_key()
-    endpoint = os.environ.get("VLLM_ENDPOINT", VLLM_ENDPOINT)
+    """Query a self-hosted OpenAI-compatible server (vLLM or llama.cpp).
+
+    Reasoning control is engine-specific. vLLM honours
+    ``chat_template_kwargs.enable_thinking`` (thinking is on by default in this
+    model's template). llama.cpp ignores that flag, so when thinking is off we
+    append the Qwen ``/no_think`` soft switch to the user turn instead. In both
+    cases a repetition penalty is sent (see _ENGINE_DEFAULT_EXTRA) and any
+    ``<think>`` preamble is stripped from the reply.
+    """
+    engine = _normalize_engine(engine)
+    endpoint = os.environ.get("VLLM_ENDPOINT") or os.environ.get("LOCAL_ENDPOINT") or VLLM_ENDPOINT
+    if not endpoint:
+        raise ValueError("VLLM_ENDPOINT (or LOCAL_ENDPOINT) not set for the local L-LLM backend")
     model = os.environ.get("VLLM_MODEL", VLLM_MODEL)
+    api_key = get_vllm_api_key()
+
+    user_content = prompt
+    extra_body = _local_extra_body(engine)
+    if engine == "vllm":
+        extra_body = _deep_merge(extra_body, {"chat_template_kwargs": {"enable_thinking": enable_thinking}})
+    elif not enable_thinking:
+        user_content = f"{prompt} /no_think"
 
     messages: list[dict[str, str]] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
+    messages.append({"role": "user", "content": user_content})
 
     payload = {
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
+        **extra_body,
     }
 
     headers = {
@@ -233,7 +341,7 @@ def _query_vllm(
 
     with httpx.Client(timeout=httpx.Timeout(timeout, connect=5.0)) as client:
         response = client.post(
-            f"{endpoint}/v1/chat/completions",
+            f"{endpoint.rstrip('/')}/v1/chat/completions",
             json=payload,
             headers=headers,
         )
@@ -242,7 +350,7 @@ def _query_vllm(
 
     choice = data["choices"][0]
     return LLMResponse(
-        content=choice["message"]["content"],
+        content=_strip_thinking(choice["message"]["content"]),
         model=data.get("model", model),
         usage=data.get("usage", {}),
         raw_response=data,

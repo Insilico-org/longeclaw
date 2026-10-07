@@ -25,7 +25,7 @@ from .control_laws import (
 )
 from .memory import get_memory
 from . import fs_access, skills
-from .llm_client import query_llm, predict_lifespan_effect, analyze_aging_mechanism, score_pathway_with_llm, get_current_backend
+from .llm_client import query_llm, predict_lifespan_effect, analyze_aging_mechanism, score_pathway_with_llm, get_current_backend, is_local_backend
 from .novel_target_generator import (
     run_novel_target_generation,
     analyze_generation_results,
@@ -334,9 +334,9 @@ def tool_query_longevity_llm(
     """Query the L-LLM (Longevity LLM) for aging biology analysis."""
     import os
     backend = get_current_backend()
-    if backend == "local":
-        if not os.environ.get("VLLM_ENDPOINT"):
-            return {"error": "VLLM_ENDPOINT environment variable not set. Local vLLM backend requires endpoint configuration."}
+    if is_local_backend(backend):
+        if not (os.environ.get("VLLM_ENDPOINT") or os.environ.get("LOCAL_ENDPOINT")):
+            return {"error": "VLLM_ENDPOINT (or LOCAL_ENDPOINT) not set. The local L-LLM backend requires an endpoint."}
     elif not os.environ.get("HF_TOKEN"):
         return {"error": "HF_TOKEN environment variable not set. HuggingFace backend requires authentication."}
 

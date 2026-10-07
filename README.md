@@ -185,24 +185,40 @@ cp .env.example .env
 | `ANTHROPIC_FOUNDRY_ENDPOINT` | Yes* | Azure Foundry endpoint (alternative to direct API) |
 | `ANTHROPIC_FOUNDRY_API_KEY` | Yes* | Azure Foundry API key |
 | `HF_TOKEN` | No | HuggingFace token for L-LLM inference endpoints |
-| `LLM_BACKEND` | No | Set to `vllm` for local vLLM server |
-| `VLLM_ENDPOINT` | No | Local vLLM server URL |
-| `VLLM_MODEL` | No | Model name served by vLLM |
-| `VLLM_API_KEY` | No | Optional auth for vLLM |
+| `LLM_BACKEND` | No | L-LLM backend: `hf` (default), `local`, `vllm`, or `llamacpp` |
+| `LOCAL_ENGINE` | No | Engine for `LLM_BACKEND=local`: `vllm` (default) or `llamacpp` |
+| `VLLM_ENDPOINT` | No | Self-hosted server URL (alias: `LOCAL_ENDPOINT`) |
+| `VLLM_MODEL` | No | Served-model-name (vLLM) / `--alias` (llama.cpp) |
+| `VLLM_API_KEY` | No | Optional bearer token (only if server set `--api-key`) |
+| `LOCAL_EXTRA_BODY` | No | Extra sampling params merged into each local request (JSON) |
 
 *Either `ANTHROPIC_API_KEY` or `ANTHROPIC_FOUNDRY_*` required.
 
-**Local vLLM Backend:**
+**Local L-LLM Backend (vLLM or llama.cpp):**
 
-For running with a local vLLM server instead of HuggingFace endpoints:
+Serve the longevity model behind an OpenAI-compatible API and point the client at
+it, instead of using a HuggingFace endpoint. Two engines are supported; they
+differ only in how reasoning is disabled, which the client handles for you:
 
 ```bash
-# Configure in .env
-LLM_BACKEND=vllm
-VLLM_ENDPOINT=http://your-server:8770
-VLLM_MODEL=your-model-name
-VLLM_API_KEY=your-optional-api-key
+# Official bf16 weights on vLLM (honours the enable_thinking switch)
+LLM_BACKEND=local
+LOCAL_ENGINE=vllm
+VLLM_ENDPOINT=http://localhost:8000
+VLLM_MODEL=longevity-llm            # must match --served-model-name
+
+# Quantized GGUF on llama.cpp (uses the Qwen /no_think soft switch)
+LLM_BACKEND=local
+LOCAL_ENGINE=llamacpp
+VLLM_ENDPOINT=http://localhost:8011
+VLLM_MODEL=teacher                  # must match --alias
 ```
+
+`LLM_BACKEND=vllm` and `LLM_BACKEND=llamacpp` are shorthands that pin the engine
+without a separate `LOCAL_ENGINE`. The API key is optional — set `VLLM_API_KEY`
+only if the server was started with `--api-key`. A repetition penalty of 1.1 is
+sent by default (the model loops without it); add `top_p`/`top_k`/etc. via
+`LOCAL_EXTRA_BODY`.
 
 **Batch Target Discovery Scripts:**
 

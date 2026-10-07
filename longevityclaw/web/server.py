@@ -534,11 +534,11 @@ async def llm_pathway_score(request: Request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
     import os
-    from longevityclaw.llm_client import get_current_backend
+    from longevityclaw.llm_client import get_current_backend, is_local_backend
     backend = get_current_backend()
-    if backend == "local":
-        if not os.environ.get("VLLM_ENDPOINT"):
-            return JSONResponse({"error": "VLLM_ENDPOINT not configured for local backend"}, status_code=503)
+    if is_local_backend(backend):
+        if not (os.environ.get("VLLM_ENDPOINT") or os.environ.get("LOCAL_ENDPOINT")):
+            return JSONResponse({"error": "VLLM_ENDPOINT (or LOCAL_ENDPOINT) not configured for local backend"}, status_code=503)
     elif not os.environ.get("HF_TOKEN"):
         return JSONResponse({"error": "HF_TOKEN not configured for HuggingFace backend"}, status_code=503)
 
@@ -565,11 +565,11 @@ async def llm_lifespan_predict(request: Request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
     import os
-    from longevityclaw.llm_client import get_current_backend
+    from longevityclaw.llm_client import get_current_backend, is_local_backend
     backend = get_current_backend()
-    if backend == "local":
-        if not os.environ.get("VLLM_ENDPOINT"):
-            return JSONResponse({"error": "VLLM_ENDPOINT not configured for local backend"}, status_code=503)
+    if is_local_backend(backend):
+        if not (os.environ.get("VLLM_ENDPOINT") or os.environ.get("LOCAL_ENDPOINT")):
+            return JSONResponse({"error": "VLLM_ENDPOINT (or LOCAL_ENDPOINT) not configured for local backend"}, status_code=503)
     elif not os.environ.get("HF_TOKEN"):
         return JSONResponse({"error": "HF_TOKEN not configured for HuggingFace backend"}, status_code=503)
 
@@ -606,11 +606,11 @@ async def llm_mechanism(request: Request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
     import os
-    from longevityclaw.llm_client import get_current_backend
+    from longevityclaw.llm_client import get_current_backend, is_local_backend
     backend = get_current_backend()
-    if backend == "local":
-        if not os.environ.get("VLLM_ENDPOINT"):
-            return JSONResponse({"error": "VLLM_ENDPOINT not configured for local backend"}, status_code=503)
+    if is_local_backend(backend):
+        if not (os.environ.get("VLLM_ENDPOINT") or os.environ.get("LOCAL_ENDPOINT")):
+            return JSONResponse({"error": "VLLM_ENDPOINT (or LOCAL_ENDPOINT) not configured for local backend"}, status_code=503)
     elif not os.environ.get("HF_TOKEN"):
         return JSONResponse({"error": "HF_TOKEN not configured for HuggingFace backend"}, status_code=503)
 

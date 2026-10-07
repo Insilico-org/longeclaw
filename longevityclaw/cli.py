@@ -126,6 +126,7 @@ BANNER = f"""
 COMMANDS = {
     "/help": "Show available commands and usage tips",
     "/clocks": "List all available clock modalities and counts",
+    "/l_llm": "Ask the L-LLM directly (/l_llm [--think|--no-think] <question>)",
     "/skills": "List saved skills (invoke one with /<skill-name>)",
     "/allowed": "Show directories the agent may read/write",
     "/grant": "Grant the agent access to a file or folder (/grant <path>)",
@@ -145,6 +146,7 @@ COMMAND_HELP = f"""
 [bold]Commands:[/bold]
   [{C_MID}]/help[/{C_MID}]      Show this help message
   [{C_MID}]/clocks[/{C_MID}]    List clock modalities and counts
+  [{C_MID}]/l_llm[/{C_MID}]     Ask the L-LLM directly — "/l_llm why does rapamycin extend lifespan?"; thinking is picked from context ([{C_MID}]--think[/{C_MID}]/[{C_MID}]--no-think[/{C_MID}] to force)
   [{C_MID}]/skills[/{C_MID}]    List saved skills — invoke one by typing /<skill-name>
   [{C_MID}]/allowed[/{C_MID}]   Show directories the agent may read/write
   [{C_MID}]/grant[/{C_MID}]     Grant access to a file or folder — "/grant ~/data/project"
@@ -171,6 +173,43 @@ COMMAND_HELP = f"""
   • Analyze transcriptome: "analyze @data/example_blood_transcriptome_age51.csv"
   • Analyze proteome: "analyze @data/example_plasma_proteome_age55.csv for a 55 year old"
 """
+
+
+# ── /l_llm direct query ─────────────────────────────────────────────────
+
+# A grounding system prompt lifts factuality more than any decoding knob (L-LLM
+# deployment guide §7); pair it with greedy decoding for reproducibility.
+_LLLM_SYSTEM_PROMPT = (
+    "You are a helpful assistant with expertise in aging biology. Ground every "
+    "claim in established literature. If a gene symbol, CpG identifier, or finding "
+    "is not one you recognise, say so explicitly and do not speculate. Never invent "
+    "effect sizes."
+)
+# Reasoning roughly doubles the token count, so budget more when it is on.
+_LLLM_MAX_TOKENS_THINK = 2200
+_LLLM_MAX_TOKENS_FAST = 900
+# Cues that a question is open-ended / high-stakes enough to warrant reasoning.
+_LLLM_THINK_CUES = (
+    "why", "how does", "how do", "how can", "mechanism", "explain", "compare",
+    "contrast", "predict", "hypothes", "propose", "design", "implication",
+    "trade-off", "tradeoff", "strateg", "evaluate", "reason", "what if",
+    "relationship between", "pros and cons", "rank ", "prioriti", "interpret",
+)
+
+
+def _llm_decide_thinking(query: str) -> tuple[bool, str]:
+    """Pick reasoning on/off from the question itself (the /l_llm "auto" mode).
+
+    Defaults off — cheaper, reproducible, and the right call for factual lookups
+    (guide §7) — and flips on for open-ended/high-stakes or long prompts. Returns
+    (enable_thinking, short reason) so the CLI can show why it chose.
+    """
+    ql = query.lower()
+    if any(cue in ql for cue in _LLLM_THINK_CUES):
+        return True, "open-ended question"
+    if len(query.split()) > 40:
+        return True, "long/complex query"
+    return False, "factual lookup"
 
 
 # ── Autocomplete ───────────────────────────────────────────────────────
@@ -1322,6 +1361,51 @@ def main():
                 trace = _pick_trace(agent.traces, session)
                 if trace:
                     _render_trace(trace)
+                continue
+
+            elif cmd == "/l_llm":
+                from .llm_client import (
+                    query_llm, get_current_backend, get_local_engine, is_local_backend,
+                )
+                rest = user_input[len("/l_llm"):].strip()
+                # Optional explicit override; otherwise decide from context.
+                force = None
+                first, _, tail = rest.partition(" ")
+                fl = first.lower()
+                if fl in ("--think", "--thinking", "think:", "+think"):
+                    force, rest = True, tail.strip()
+                elif fl in ("--no-think", "--nothink", "no-think:", "nothink:", "-think"):
+                    force, rest = False, tail.strip()
+                if not rest:
+                    console.print(f"[{C_DARK}]  usage: /l_llm [--think|--no-think] <question>[/{C_DARK}]")
+                    continue
+                think, why = _llm_decide_thinking(rest) if force is None else (force, "forced")
+                engine = get_local_engine() if is_local_backend() else get_current_backend()
+                console.print(
+                    f"[{C_DARK}]  L-LLM · thinking {'on' if think else 'off'} ({why}) · {engine}[/{C_DARK}]"
+                )
+                if think and is_local_backend() and get_local_engine() == "llamacpp":
+                    console.print(
+                        f"[{C_DARK}]  note: this GGUF has no reasoning delimiter — the reply will "
+                        f"include its reasoning trace[/{C_DARK}]"
+                    )
+                try:
+                    with console.status(f"[{C_DARK}]querying L-LLM…[/{C_DARK}]", spinner="dots"):
+                        resp = query_llm(
+                            rest,
+                            system_prompt=_LLLM_SYSTEM_PROMPT,
+                            max_tokens=_LLLM_MAX_TOKENS_THINK if think else _LLLM_MAX_TOKENS_FAST,
+                            temperature=0.0,
+                            enable_thinking=think,
+                        )
+                except Exception as e:
+                    console.print(f"[bold {C_DEEP}]error>[/bold {C_DEEP}] L-LLM query failed: {e}")
+                    continue
+                console.print(Markdown(resp.content.strip() or "_(empty response)_"))
+                u = resp.usage or {}
+                it = u.get("prompt_tokens", u.get("input_tokens", 0))
+                ot = u.get("completion_tokens", u.get("output_tokens", 0))
+                console.print(f"[{C_DARK}]  {resp.model} · {it}+{ot} tok[/{C_DARK}]")
                 continue
 
             else:
