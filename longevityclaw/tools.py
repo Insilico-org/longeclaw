@@ -24,7 +24,8 @@ from .control_laws import (
     HALLMARKS,
 )
 from .memory import get_memory
-from .llm_client import query_llm, predict_lifespan_effect, analyze_aging_mechanism, score_pathway_with_llm, get_current_backend
+from . import fs_access, skills
+from .llm_client import query_llm, predict_lifespan_effect, analyze_aging_mechanism, score_pathway_with_llm, get_current_backend, is_local_backend
 from .novel_target_generator import (
     run_novel_target_generation,
     analyze_generation_results,
@@ -333,9 +334,9 @@ def tool_query_longevity_llm(
     """Query the L-LLM (Longevity LLM) for aging biology analysis."""
     import os
     backend = get_current_backend()
-    if backend == "local":
-        if not os.environ.get("VLLM_ENDPOINT"):
-            return {"error": "VLLM_ENDPOINT environment variable not set. Local vLLM backend requires endpoint configuration."}
+    if is_local_backend(backend):
+        if not (os.environ.get("VLLM_ENDPOINT") or os.environ.get("LOCAL_ENDPOINT")):
+            return {"error": "VLLM_ENDPOINT (or LOCAL_ENDPOINT) not set. The local L-LLM backend requires an endpoint."}
     elif not os.environ.get("HF_TOKEN"):
         return {"error": "HF_TOKEN environment variable not set. HuggingFace backend requires authentication."}
 
@@ -477,6 +478,151 @@ def tool_validate_targets(genes: list[str]) -> dict:
         }
     except Exception as e:
         return {"error": f"OpenTargets validation failed: {e}"}
+
+
+# ── Filesystem tools (workspace-confined, policy-gated) ────────────────
+
+def tool_read_file(file_path: str, max_bytes: int = fs_access.MAX_READ_BYTES) -> dict:
+    """Read a UTF-8 text file from within the workspace."""
+    if not fs_access.can_read():
+        return {"error": "Filesystem access is disabled (LONGEVITYCLAW_FS=off)."}
+    try:
+        resolved = fs_access.resolve_in_workspace(file_path)
+    except fs_access.FsAccessError as e:
+        return {"error": str(e)}
+    if not resolved.exists() or not resolved.is_file():
+        return {"error": f"No such file: {file_path}"}
+
+    cap = min(int(max_bytes), fs_access.MAX_READ_BYTES)
+    raw = resolved.read_bytes()
+    truncated = len(raw) > cap
+    chunk = raw[:cap]
+    if b"\x00" in chunk[:4096]:
+        return {"path": fs_access.relative_to_workspace(resolved),
+                "error": "File appears to be binary; cannot display as text.",
+                "bytes": len(raw)}
+    return {
+        "path": fs_access.relative_to_workspace(resolved),
+        "bytes": len(raw),
+        "truncated": truncated,
+        "content": chunk.decode("utf-8", errors="replace"),
+    }
+
+
+def tool_list_dir(dir_path: str = ".") -> dict:
+    """List the contents of a directory within the workspace."""
+    if not fs_access.can_read():
+        return {"error": "Filesystem access is disabled (LONGEVITYCLAW_FS=off)."}
+    try:
+        resolved = fs_access.resolve_in_workspace(dir_path)
+    except fs_access.FsAccessError as e:
+        return {"error": str(e)}
+    if not resolved.is_dir():
+        return {"error": f"Not a directory: {dir_path}"}
+
+    entries = []
+    for entry in sorted(resolved.iterdir(), key=lambda p: (p.is_file(), p.name)):
+        is_dir = entry.is_dir()
+        try:
+            size = entry.stat().st_size if not is_dir else None
+        except OSError:
+            size = None
+        entries.append({"name": entry.name + ("/" if is_dir else ""),
+                        "type": "dir" if is_dir else "file", "size": size})
+        if len(entries) >= fs_access.MAX_LIST_ENTRIES:
+            break
+    return {"path": fs_access.relative_to_workspace(resolved),
+            "n_entries": len(entries), "entries": entries}
+
+
+def tool_write_file(file_path: str, content: str, overwrite: bool = False) -> dict:
+    """Write a text file within the workspace (read/write policy only)."""
+    if not fs_access.can_write():
+        return {"error": "Writing is disabled by policy "
+                         f"(LONGEVITYCLAW_FS={fs_access.get_policy()})."}
+    if len(content.encode("utf-8")) > fs_access.MAX_WRITE_BYTES:
+        return {"error": f"Content exceeds the {fs_access.MAX_WRITE_BYTES}-byte write limit."}
+    try:
+        resolved = fs_access.resolve_in_workspace(file_path)
+    except fs_access.FsAccessError as e:
+        return {"error": str(e)}
+    existed = resolved.exists()
+    if existed and not overwrite:
+        return {"error": f"File exists: {file_path}. Pass overwrite=true to replace it."}
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.write_text(content, encoding="utf-8")
+    return {"path": fs_access.relative_to_workspace(resolved),
+            "bytes_written": len(content.encode("utf-8")),
+            "action": "overwritten" if existed else "created"}
+
+
+def tool_edit_file(file_path: str, old_string: str, new_string: str,
+                   replace_all: bool = False) -> dict:
+    """Replace an exact substring in a workspace file (read/write policy only)."""
+    if not fs_access.can_write():
+        return {"error": "Editing is disabled by policy "
+                         f"(LONGEVITYCLAW_FS={fs_access.get_policy()})."}
+    try:
+        resolved = fs_access.resolve_in_workspace(file_path)
+    except fs_access.FsAccessError as e:
+        return {"error": str(e)}
+    if not resolved.is_file():
+        return {"error": f"No such file: {file_path}"}
+
+    text = resolved.read_text(encoding="utf-8")
+    count = text.count(old_string)
+    if count == 0:
+        return {"error": "old_string not found in file."}
+    if count > 1 and not replace_all:
+        return {"error": f"old_string occurs {count} times; pass replace_all=true "
+                         "or supply a longer unique string."}
+    updated = text.replace(old_string, new_string)
+    resolved.write_text(updated, encoding="utf-8")
+    return {"path": fs_access.relative_to_workspace(resolved),
+            "replacements": count if replace_all else 1}
+
+
+# ── Skill tools (save / list / run repeatable procedures) ──────────────
+
+def tool_save_skill(name: str, description: str, instructions: str,
+                    keywords: list[str] | None = None) -> dict:
+    """Save a reusable procedure as a named skill."""
+    if not fs_access.can_write():
+        return {"error": "Saving skills is disabled by policy "
+                         f"(LONGEVITYCLAW_FS={fs_access.get_policy()})."}
+    try:
+        saved = skills.save_skill(name, description, instructions, keywords)
+    except ValueError as e:
+        return {"error": str(e)}
+    return {"saved": True, **saved,
+            "note": f"Skill saved. The user can replay it by typing {saved['invoke_with']}."}
+
+
+def tool_list_skills() -> dict:
+    """List all saved skills."""
+    catalog = [
+        {"name": s["name"], "slug": s["slug"], "description": s["description"],
+         "keywords": s["keywords"], "invoke_with": f"/{s['slug']}"}
+        for s in skills.list_skills()
+    ]
+    return {"n_skills": len(catalog), "skills": catalog}
+
+
+def tool_run_skill(name: str, arguments: str | None = None) -> dict:
+    """Load a saved skill's instructions so they can be followed now."""
+    skill = skills.get_skill(name)
+    if not skill:
+        available = [s["slug"] for s in skills.list_skills()]
+        return {"error": f"No skill named '{name}'.", "available_skills": available}
+    return {
+        "name": skill["name"],
+        "slug": skill["slug"],
+        "description": skill["description"],
+        "instructions": skill["instructions"],
+        "arguments": arguments or "",
+        "note": "Follow these instructions now, using the provided arguments and the "
+                "current conversation context. Call whatever tools the steps require.",
+    }
 
 
 # ── Tool registry for the agent ────────────────────────────────────────
@@ -1146,7 +1292,7 @@ TOOLS = [
         "handler": lambda key=None: {"memory": get_memory().recall(key)},
     },
     {
-        "name": "discover_novel_targets",
+        "name": "discover_targets",
         "description": "Run novel target discovery using 6-dimension scoring. Generates NOVEL + DRUGGABLE aging targets across 14 hallmarks with scores: Novelty (0-100), Druggability (0-100), Confidence (0-100), Safety (0-100), Commercial (0-100), Mechanism (0-100). Filter: Novelty >= 76 AND Druggability >= 51 = 'novel druggable' target. Returns ranked targets emphasizing underexplored genes with therapeutic potential.",
         "input_schema": {
             "type": "object",
@@ -1188,6 +1334,94 @@ TOOLS = [
             "required": ["genes"],
         },
         "handler": tool_validate_targets,
+    },
+    {
+        "name": "read_file",
+        "description": "Read a UTF-8 text file from the workspace (e.g. CLAUDE.md, a README, a notes file, a script, or a data file you want to inspect as text). Paths are relative to the workspace root or absolute within it; access outside the workspace is refused. Use this for general file reading — for running aging clocks on an omics CSV use predict_age_from_file instead.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the file (workspace-relative or absolute within the workspace)"},
+                "max_bytes": {"type": "integer", "description": "Max bytes to read (default 1,000,000)"},
+            },
+            "required": ["file_path"],
+        },
+        "handler": lambda file_path, max_bytes=fs_access.MAX_READ_BYTES: tool_read_file(file_path, max_bytes),
+    },
+    {
+        "name": "list_dir",
+        "description": "List the files and subdirectories of a directory within the workspace. Use this to discover what files are available before reading or analyzing them.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "dir_path": {"type": "string", "description": "Directory path (default: workspace root '.')"},
+            },
+            "required": [],
+        },
+        "handler": lambda dir_path=".": tool_list_dir(dir_path),
+    },
+    {
+        "name": "write_file",
+        "description": "Write a text file within the workspace (e.g. save a report, an exported result, a script, or notes). Refuses to overwrite an existing file unless overwrite=true. Only available when the filesystem policy is read/write (the local CLI); disabled in the hosted web app.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Destination path (workspace-relative or absolute within the workspace)"},
+                "content": {"type": "string", "description": "Full text content to write"},
+                "overwrite": {"type": "boolean", "description": "Allow replacing an existing file (default false)"},
+            },
+            "required": ["file_path", "content"],
+        },
+        "handler": lambda file_path, content, overwrite=False: tool_write_file(file_path, content, overwrite),
+    },
+    {
+        "name": "edit_file",
+        "description": "Replace an exact substring in an existing workspace text file. The old_string must match exactly and be unique unless replace_all=true. Use this for small, targeted edits instead of rewriting a whole file. Read/write policy only.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the file to edit"},
+                "old_string": {"type": "string", "description": "Exact text to find"},
+                "new_string": {"type": "string", "description": "Replacement text"},
+                "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)"},
+            },
+            "required": ["file_path", "old_string", "new_string"],
+        },
+        "handler": lambda file_path, old_string, new_string, replace_all=False: tool_edit_file(file_path, old_string, new_string, replace_all),
+    },
+    {
+        "name": "save_skill",
+        "description": "Save a reusable procedure as a named skill so the user can replay it later by typing /<skill-name>. Use this when the user asks to 'save this as a skill', 'remember how to do this', or 'make this repeatable'. Write the instructions as a generalized, step-by-step recipe (referring to the tools you used and what inputs they need), not a transcript of this specific run — so it works on future inputs. Skills are prompt recipes: replaying one re-runs the steps with fresh inputs.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Short human-readable skill name (becomes the /slug)"},
+                "description": {"type": "string", "description": "One-line summary of what the skill does"},
+                "instructions": {"type": "string", "description": "Generalized step-by-step instructions for performing the procedure, including which tools to call and what inputs they need"},
+                "keywords": {"type": "array", "items": {"type": "string"}, "description": "Optional trigger keywords for discovery"},
+            },
+            "required": ["name", "description", "instructions"],
+        },
+        "handler": lambda name, description, instructions, keywords=None: tool_save_skill(name, description, instructions, keywords),
+    },
+    {
+        "name": "list_skills",
+        "description": "List the user's saved skills with their names, descriptions, and how to invoke them. Use this when the user asks what skills exist or to find a relevant saved procedure.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "handler": lambda: tool_list_skills(),
+    },
+    {
+        "name": "run_skill",
+        "description": "Load a saved skill's recorded instructions so you can follow them now with the current inputs. Use this when the user invokes a skill (e.g. types /skill-name) or asks to run a saved procedure. After calling it, carry out the returned step-by-step instructions, calling whatever tools they require.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Skill name or slug to run"},
+                "arguments": {"type": "string", "description": "Optional inputs the user supplied for this run (e.g. a file path, an age, a gene)"},
+            },
+            "required": ["name"],
+        },
+        "handler": lambda name, arguments=None: tool_run_skill(name, arguments),
     },
 ]
 

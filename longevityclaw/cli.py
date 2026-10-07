@@ -9,6 +9,7 @@ import sys
 import glob
 import time
 import random
+import threading
 from pathlib import Path
 
 from rich.console import Console, Group
@@ -19,6 +20,7 @@ from rich.live import Live
 from rich.style import Style
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application import get_app
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style as PTStyle
@@ -124,6 +126,14 @@ BANNER = f"""
 COMMANDS = {
     "/help": "Show available commands and usage tips",
     "/clocks": "List all available clock modalities and counts",
+    "/l_llm": "Ask the L-LLM directly (/l_llm [--think|--no-think] <question>)",
+    "/skills": "List saved skills (invoke one with /<skill-name>)",
+    "/allowed": "Show directories the agent may read/write",
+    "/grant": "Grant the agent access to a file or folder (/grant <path>)",
+    "/loop": "Repeat a request on a timer (/loop [freq] <task>, Ctrl-C to stop)",
+    "/empty_queue": "Clear any follow-up message you've queued",
+    "/effort": "Cap tool calls per response (/effort low|medium|high|max)",
+    "/usage": "Show session token/model/tool/skill usage (Esc to dismiss)",
     "/save": "Save conversation to markdown file",
     "/showwhy": "Show agent reasoning trace for a recent request",
     "/clear": "Clear conversation history (start fresh)",
@@ -136,6 +146,14 @@ COMMAND_HELP = f"""
 [bold]Commands:[/bold]
   [{C_MID}]/help[/{C_MID}]      Show this help message
   [{C_MID}]/clocks[/{C_MID}]    List clock modalities and counts
+  [{C_MID}]/l_llm[/{C_MID}]     Ask the L-LLM directly — "/l_llm why does rapamycin extend lifespan?"; thinking is picked from context ([{C_MID}]--think[/{C_MID}]/[{C_MID}]--no-think[/{C_MID}] to force)
+  [{C_MID}]/skills[/{C_MID}]    List saved skills — invoke one by typing /<skill-name>
+  [{C_MID}]/allowed[/{C_MID}]   Show directories the agent may read/write
+  [{C_MID}]/grant[/{C_MID}]     Grant access to a file or folder — "/grant ~/data/project"
+  [{C_MID}]/loop[/{C_MID}]      Repeat a request on a timer — "/loop 30m check PubMed for new GrimAge papers" (Ctrl-C stops)
+  [{C_MID}]/empty_queue[/{C_MID}]  Clear a follow-up you queued while the model was working
+  [{C_MID}]/effort[/{C_MID}]    Cap tool calls per response — low (5) · medium (10) · high (20) · max (unlimited); skills bypass it
+  [{C_MID}]/usage[/{C_MID}]     Show session usage — tokens by model, L-LLM calls, tools & skills (Esc to dismiss)
   [{C_MID}]/save[/{C_MID}]      Save conversation to markdown (optional: /save filename.md)
   [{C_MID}]/showwhy[/{C_MID}]   Show agent reasoning trace (tool calls, inputs, results)
   [{C_MID}]/clear[/{C_MID}]     Clear conversation history
@@ -155,6 +173,43 @@ COMMAND_HELP = f"""
   • Analyze transcriptome: "analyze @data/example_blood_transcriptome_age51.csv"
   • Analyze proteome: "analyze @data/example_plasma_proteome_age55.csv for a 55 year old"
 """
+
+
+# ── /l_llm direct query ─────────────────────────────────────────────────
+
+# A grounding system prompt lifts factuality more than any decoding knob (L-LLM
+# deployment guide §7); pair it with greedy decoding for reproducibility.
+_LLLM_SYSTEM_PROMPT = (
+    "You are a helpful assistant with expertise in aging biology. Ground every "
+    "claim in established literature. If a gene symbol, CpG identifier, or finding "
+    "is not one you recognise, say so explicitly and do not speculate. Never invent "
+    "effect sizes."
+)
+# Reasoning roughly doubles the token count, so budget more when it is on.
+_LLLM_MAX_TOKENS_THINK = 2200
+_LLLM_MAX_TOKENS_FAST = 900
+# Cues that a question is open-ended / high-stakes enough to warrant reasoning.
+_LLLM_THINK_CUES = (
+    "why", "how does", "how do", "how can", "mechanism", "explain", "compare",
+    "contrast", "predict", "hypothes", "propose", "design", "implication",
+    "trade-off", "tradeoff", "strateg", "evaluate", "reason", "what if",
+    "relationship between", "pros and cons", "rank ", "prioriti", "interpret",
+)
+
+
+def _llm_decide_thinking(query: str) -> tuple[bool, str]:
+    """Pick reasoning on/off from the question itself (the /l_llm "auto" mode).
+
+    Defaults off — cheaper, reproducible, and the right call for factual lookups
+    (guide §7) — and flips on for open-ended/high-stakes or long prompts. Returns
+    (enable_thinking, short reason) so the CLI can show why it chose.
+    """
+    ql = query.lower()
+    if any(cue in ql for cue in _LLLM_THINK_CUES):
+        return True, "open-ended question"
+    if len(query.split()) > 40:
+        return True, "long/complex query"
+    return False, "factual lookup"
 
 
 # ── Autocomplete ───────────────────────────────────────────────────────
@@ -202,6 +257,20 @@ class LongevityClawCompleter(Completer):
                         display=cmd,
                         display_meta=desc,
                     )
+            # Saved skills are invokable as /<slug>
+            try:
+                from .skills import list_skills
+                for skill in list_skills():
+                    slug_cmd = f"/{skill['slug']}"
+                    if slug_cmd.startswith(cmd_text):
+                        yield Completion(
+                            slug_cmd,
+                            start_position=-len(text),
+                            display=slug_cmd,
+                            display_meta=f"skill · {skill['description'][:50]}",
+                        )
+            except Exception:
+                pass
             return
 
         # ── g@ gene completion ────────────────────────────────────
@@ -408,11 +477,25 @@ def load_dotenv():
 # ── Save conversation ─────────────────────────────────────────────────
 
 def _save_conversation(messages: list[dict], filename: str | None = None):
-    """Export conversation to a markdown file."""
+    """Export conversation to a markdown file inside the workspace."""
     from datetime import datetime
+    from . import fs_access
+
+    if not fs_access.can_write():
+        console.print(f"[{C_DARK}]  saving is disabled by policy "
+                      f"(LONGEVITYCLAW_FS={fs_access.get_policy()})[/{C_DARK}]")
+        return
 
     if not filename:
         filename = f"longevityclaw_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+
+    # Resolve into the workspace (or a granted location) like the agent's tools,
+    # so /save can't write to arbitrary paths and lands somewhere predictable.
+    try:
+        target = fs_access.resolve_in_workspace(filename)
+    except fs_access.FsAccessError as e:
+        console.print(f"[{C_DARK}]  {e}[/{C_DARK}]")
+        return
 
     lines = [f"# LongevityClaw Session\n",
              f"*Saved {datetime.now().strftime('%Y-%m-%d %H:%M')}*\n\n"]
@@ -437,10 +520,11 @@ def _save_conversation(messages: list[dict], filename: str | None = None):
             if text_parts:
                 lines.append(f"## LongevityClaw\n\n{''.join(text_parts)}\n\n")
 
-    with open(filename, "w", encoding="utf-8") as f:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-    console.print(f"[{C_DARK}]  saved to {filename}[/{C_DARK}]")
+    console.print(f"[{C_DARK}]  saved to {fs_access.relative_to_workspace(target)}[/{C_DARK}]")
 
 
 # ── Streaming response for demo mode ──────────────────────────────────
@@ -454,36 +538,294 @@ def _make_panel(content):
     )
 
 
-def _stream_response(response: str):
-    """Render response progressively inside a panel, simulating streaming.
+def _print_tool_hint(agent, request_count: int):
+    """Print the 'N tools used' footer for the most recent turn."""
+    if not agent.traces:
+        return
+    last_trace = agent.traces[-1]
+    n_tools = sum(len(r["tool_calls"]) for r in last_trace["rounds"])
+    if n_tools > 0:
+        hint = "  /showwhy for details" if request_count <= 3 else ""
+        console.print(f"  [dim]{n_tools} tool{'s' if n_tools != 1 else ''} used ·{hint}[/dim]")
 
-    Short responses stream entirely word-by-word inside a Live panel.
-    Long responses stream the first screen-worth, then complete instantly
-    with the full panel (natural terminal scrolling).
+
+# ── Prompt chrome: bright status bar + reserved tip row above the input ─
+
+_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+# Shown below the status bar the first time the user queues a message this
+# session, so they learn how to cancel a queued follow-up exactly when relevant.
+_QUEUE_TIP = "/empty_queue clears any follow-up you've queued"
+_queue_tip_shown = False
+
+TIPS = [
+    'attach a file with @ — "analyze @data/sample.csv for a 60 year old"',
+    "type cl@ or g@ to autocomplete clock and gene names",
+    "/loop [freq] <task> repeats a request on a timer (Ctrl-C stops)",
+    'save a procedure as a skill, then run it with /<skill-name>',
+    "/grant <path> opens a folder outside the workspace to the agent",
+    "press Esc while the model is working to interrupt it",
+    "/showwhy reveals the agent's tool calls and reasoning",
+    "/skill-builder turns what you just did into a reusable skill",
+    "/effort low|medium|high|max caps tool calls per response (lower = faster)",
+    _QUEUE_TIP,
+]
+
+
+def _pick_tip(prob: float = 0.4) -> str:
+    """Occasionally surface a tip; empty string the rest of the time."""
+    return random.choice(TIPS) if random.random() < prob else ""
+
+
+def _make_chrome(bar_text, tip: str):
+    """Build a multi-line prompt message: a full-width bright status/separator
+    bar, a reserved tip row, then the 'you> ' input line. ``bar_text`` is a
+    callable returning the bar's inline text (re-evaluated on each redraw)."""
+    def _message():
+        try:
+            width = get_app().output.get_size().columns
+        except Exception:
+            width = 80
+        text = bar_text().strip()
+        prefix = f"── {text} " if text else "── "
+        bar = (prefix + "─" * max(0, width - len(prefix)))[:width]
+        frags = [("class:statusbar", bar + "\n")]
+        # Reserve the tip row whether or not a tip is shown, so the input
+        # position never jumps.
+        frags.append(("class:tip", f"  {tip}\n" if tip else "\n"))
+        frags.append(("class:you", "you> "))
+        return frags
+    return _message
+
+
+def _idle_bar_text(effort: str = "") -> str:
+    head = "LongevityClaw" + (f"  ·  effort: {effort}" if effort else "")
+    return f"{head}    Esc clear · Ctrl-C interrupt · Tab complete"
+
+
+# ── /usage: transient session-usage table (erased on Esc) ──────────────
+
+def _usage_renderable(agent):
+    """Build a Rich renderable summarizing this session's model/tool/skill use."""
+    from rich.table import Table
+    from .llm_client import get_llm_stats
+
+    su = agent.session_usage
+    llm = get_llm_stats()
+
+    models = Table(title="Models & tokens", title_style=f"bold {C_BRIGHT}",
+                   border_style=C_DEEP, header_style=C_MID, expand=False)
+    for col, j in (("model", "left"), ("calls", "right"), ("in", "right"),
+                   ("cached", "right"), ("out", "right"), ("total", "right")):
+        models.add_column(col, justify=j)
+    tot_in = tot_out = tot_cached = 0
+    for name, m in su["models"].items():
+        # input_tokens is the uncached remainder — true input adds the cached part
+        true_in = m["input"] + m.get("cache_read", 0) + m.get("cache_write", 0)
+        cached = m.get("cache_read", 0)
+        models.add_row(name, str(m["calls"]), f"{true_in:,}",
+                       f"{cached:,}" if cached else "—",
+                       f"{m['output']:,}", f"{true_in + m['output']:,}")
+        tot_in += true_in; tot_out += m["output"]; tot_cached += cached
+    claude_in = tot_in  # cache only applies to the Claude model(s)
+    if llm["calls"]:
+        lname = "L-LLM: " + (", ".join(llm["by_model"]) or "longevity")
+        models.add_row(lname, str(llm["calls"]), f"{llm['input']:,}", "—",
+                       f"{llm['output']:,}", f"{llm['input'] + llm['output']:,}")
+        tot_in += llm["input"]; tot_out += llm["output"]
+    if not su["models"] and not llm["calls"]:
+        models.add_row("(nothing yet)", "", "", "", "", "")
+    else:
+        models.add_section()
+        models.add_row("[bold]total[/bold]", "", f"[bold]{tot_in:,}[/bold]",
+                       f"[bold]{tot_cached:,}[/bold]" if tot_cached else "—",
+                       f"[bold]{tot_out:,}[/bold]", f"[bold]{tot_in + tot_out:,}[/bold]")
+
+    extra = Table(title="Tools & skills", title_style=f"bold {C_BRIGHT}",
+                  border_style=C_DEEP, header_style=C_MID, expand=False)
+    for col, j in (("kind", "left"), ("distinct", "right"),
+                   ("calls", "right"), ("most used", "left")):
+        extra.add_column(col, justify=j)
+    tools, skills = su["tools"], su["skills"]
+    top_tools = sorted(tools.items(), key=lambda x: -x[1])[:5]
+    extra.add_row("tools", str(len(tools)), str(sum(tools.values())),
+                  ", ".join(f"{k}×{v}" for k, v in top_tools) or "—")
+    extra.add_row("skills", str(len(skills)), str(sum(skills.values())),
+                  ", ".join(f"{k}×{v}" for k, v in skills.items()) or "—")
+
+    cap = "unlimited" if agent.tool_budget is None else f"max {agent.tool_budget} tools/response"
+    c = su.get("cache", {"read": 0, "write": 0})
+    hit = (c["read"] / claude_in * 100) if claude_in else 0
+    # Net tok-equiv vs no caching: each read costs 0.1× instead of 1× (save 0.9×);
+    # each write costs the TTL's premium over 1× (5m → 0.25×, 1h → 1.0×). Premium
+    # is read from agent so this number can never drift from the TTL we request.
+    from .agent import CACHE_WRITE_PREMIUM, CACHE_WRITE_MULTIPLIER, _CACHE_TTL
+    saved = int(c["read"] * 0.9 - c["write"] * CACHE_WRITE_PREMIUM)
+    cache_line = (f"[{C_DARK}]prompt cache:[/{C_DARK}] "
+                  f"[{C_MID}]{c['read']:,}[/{C_MID}] read (~0.1×) · "
+                  f"{c['write']:,} written (~{CACHE_WRITE_MULTIPLIER:g}×, {_CACHE_TTL} TTL) · "
+                  f"[{C_MID}]{hit:.0f}%[/{C_MID}] of Claude input cached "
+                  f"[{C_DARK}](≈{saved:,} tok-equiv {'saved' if saved >= 0 else 'lost'})[/{C_DARK}]"
+                  + ("   [dim](0 = caching inactive / silent invalidator)[/dim]"
+                     if not c["read"] else ""))
+    return Group(f"[bold {C_BRIGHT}]Session usage[/bold {C_BRIGHT}]   "
+                 f"[{C_DARK}]effort: {agent.effort} ({cap})[/{C_DARK}]", "",
+                 models, "", extra, "", cache_line)
+
+
+def _render_ansi(renderable) -> str:
+    """Render a Rich renderable to an ANSI string for embedding in prompt_toolkit."""
+    from io import StringIO
+    buf = StringIO()
+    tmp = Console(file=buf, force_terminal=True, color_system="truecolor",
+                  width=min(console.size.width, 100))
+    tmp.print(renderable)
+    return buf.getvalue()
+
+
+def _show_usage(agent):
+    """Display the usage table in a transient overlay that erases when Esc is
+    pressed (the table never persists in the chat — only the /usage command)."""
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.layout import Layout, HSplit, Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.formatted_text import ANSI
+    from prompt_toolkit.key_binding import KeyBindings
+
+    body = _render_ansi(_usage_renderable(agent))
+
+    def _content():
+        return ANSI(body + f"\n  Esc to return to chat")
+
+    kb = KeyBindings()
+
+    @kb.add("escape")
+    @kb.add("enter")
+    @kb.add("q")
+    @kb.add("c-c")
+    def _(event):
+        event.app.exit()
+
+    app = Application(
+        layout=Layout(HSplit([Window(content=FormattedTextControl(_content),
+                                     wrap_lines=True)])),
+        key_bindings=kb,
+        erase_when_done=True,
+        full_screen=False,
+    )
+    try:
+        app.run()
+    except (KeyboardInterrupt, EOFError):
+        pass
+
+
+# ── /loop: repeat a request on a timer ─────────────────────────────────
+
+_DURATION_RE = re.compile(r"^(\d+)\s*([smh]?)$", re.IGNORECASE)
+
+
+def _parse_loop_args(rest: str) -> tuple[int, str]:
+    """Parse '[frequency] task'. Frequency is 30s / 5m / 2h, or a bare integer
+    (minutes). With no leading frequency, defaults to 10 minutes. Returns
+    (interval_seconds, task); interval is floored at 5s to avoid hammering."""
+    parts = rest.split(maxsplit=1)
+    if parts and (m := _DURATION_RE.match(parts[0])):
+        unit = (m.group(2) or "m").lower()
+        secs = int(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[unit]
+        task = parts[1] if len(parts) > 1 else ""
+    else:
+        secs, task = 600, rest
+    return max(secs, 5), task.strip()
+
+
+def _fmt_interval(secs: int) -> str:
+    if secs >= 3600 and secs % 3600 == 0:
+        return f"{secs // 3600}h"
+    if secs >= 60 and secs % 60 == 0:
+        return f"{secs // 60}m"
+    return f"{secs}s"
+
+
+def _loop_wait(interval: int, status):
+    """Sleep `interval` seconds with a live countdown; Ctrl-C breaks out."""
+    status.start()
+    try:
+        for remaining in range(interval, 0, -1):
+            status.update(f"next run in {_fmt_interval(remaining)} (Ctrl-C to stop)")
+            time.sleep(1)
+    finally:
+        status.stop()
+
+
+def _run_loop(agent, task: str, interval: int, status, stream_enabled: bool):
+    """Send `task` to the agent repeatedly every `interval` seconds until the
+    user presses Ctrl-C. Each iteration renders like a normal turn."""
+    console.print(f"  [dim]looping every {_fmt_interval(interval)} — Ctrl-C to stop[/dim]")
+    n = 0
+    try:
+        while True:
+            n += 1
+            console.print(f"\n  [{C_MID}]loop #{n}[/{C_MID}]  [dim]{task}[/dim]")
+            try:
+                status.start()
+                response = agent.chat(task)
+                status.stop()
+            except Exception as e:
+                status.stop()
+                console.print(f"  [bold {C_DEEP}]error>[/bold {C_DEEP}] {e}")
+                response = None
+            if response is not None:
+                console.print()
+                if stream_enabled:
+                    _stream_response(response)
+                else:
+                    console.print(_make_panel(Markdown(response)))
+                _print_tool_hint(agent, 99)  # past the /showwhy intro hint
+            _loop_wait(interval, status)
+    except KeyboardInterrupt:
+        status.stop()
+        console.print(f"\n  [dim italic]loop stopped after {n} run{'s' if n != 1 else ''}[/dim italic]")
+
+
+def _stream_response(response: str):
+    """Pseudo-stream the first part of the answer, then print the whole thing
+    at once.
+
+    Short answers stream word-by-word in full. Long answers stream only a brief
+    first window — kept small and clear of the screen edge — then complete
+    instantly with the full panel. Keeping the streamed region small avoids the
+    flicker that tall Live regions cause near the bottom of the screen, and the
+    line/time caps stop a long answer from streaming forever.
     """
+    # console.size can mis-report right after a prompt_toolkit app closes; clamp
+    # it so a bad reading can't disable the long-answer cutoff.
     term_h = console.size.height
+    if not (8 <= term_h <= 400):
+        term_h = 30
     usable_w = max(console.size.width - 8, 40)
-    stream_limit = term_h - 6
-    est_total = sum(1 + len(line) // usable_w for line in response.split("\n")) + 6
-    is_long = est_total > stream_limit
+
+    def _wrapped(text: str) -> int:
+        return sum(1 + len(ln) // usable_w for ln in text.split("\n"))
+
+    # Stream at most a small window: never near the screen edge, never huge.
+    stream_lines = max(6, min(term_h - 8, 16))
+    is_long = _wrapped(response) > stream_lines
 
     words = response.split(" ")
     shown = ""
     chunk_size = 1
+    t0 = time.time()
 
     with Live(
         _make_panel(Markdown("")),
-        console=console, refresh_per_second=24,
+        console=console, refresh_per_second=20,
         transient=is_long,
     ) as live:
         i = 0
         while i < len(words):
-            batch = words[i:i + chunk_size]
-            shown += " ".join(batch) + " "
-            if is_long:
-                est_lines = sum(1 + len(ln) // usable_w for ln in shown.split("\n")) + 6
-                if est_lines > stream_limit:
-                    break
+            shown += " ".join(words[i:i + chunk_size]) + " "
+            if is_long and (_wrapped(shown) >= stream_lines or time.time() - t0 > 1.5):
+                break
             live.update(_make_panel(Markdown(shown)))
             i += chunk_size
             chunk_size = random.randint(1, 4)
@@ -492,6 +834,108 @@ def _stream_response(response: str):
     if is_long:
         console.print(_make_panel(Markdown(response)))
 
+
+# ── Type-ahead chat ────────────────────────────────────────────────────
+
+def _chat_with_typeahead(agent, user_input, session, status_text):
+    """Run ``agent.chat(user_input)`` in a worker thread while the user composes
+    their next message at a live prompt.
+
+    Returns ``(response, error, next_text, submitted, interrupted)``:
+        response    - the agent's reply, or None if chat() raised
+        error       - the exception if chat() raised, else None
+        next_text   - whatever the user typed while waiting (may be "")
+        submitted   - True if the user pressed Enter (next_text is ready to send),
+                      False if it is an unfinished draft (or nothing was sent)
+        interrupted - True if the user cancelled this turn (Ctrl-C / Esc)
+    """
+    global _queue_tip_shown
+    holder: dict = {}
+    by_worker = {"flag": False}
+
+    def _worker():
+        try:
+            holder["resp"] = agent.chat(user_input)
+        except Exception as e:  # surfaced to the caller; never crash the thread
+            holder["err"] = e
+        # When generation finishes, close whichever live prompt is currently open
+        # so its answer can render. The prompt may be momentarily between renders
+        # (e.g. just after the user pressed Enter, before it reopens), so retry
+        # briefly until we catch it running.
+        app = session.app
+
+        def _close():
+            if app.is_running:
+                by_worker["flag"] = True
+                app.exit(result=app.current_buffer.text)
+
+        for _ in range(100):
+            try:
+                if app.is_running and app.loop is not None:
+                    app.loop.call_soon_threadsafe(_close)
+                    return
+            except (RuntimeError, AttributeError):
+                pass
+            time.sleep(0.05)
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+
+    queued = None    # an Enter-submitted follow-up, kept separate from the live
+                     # buffer so it can't be lost by later edits/clears
+    tail = ""        # an unsent draft in the buffer when the answer arrives
+    notified = False
+    tip = _pick_tip()
+
+    def _live_bar():
+        frame = _SPINNER[int(time.time() * 5) % len(_SPINNER)]
+        parts = [status_text[k] for k in ("main", "detail", "stats") if status_text.get(k)]
+        line = "  ·  ".join(parts) if parts else "working…"
+        suffix = "next queued ✓ · Esc to interrupt" if queued else "Esc to interrupt"
+        return f"{frame} {line}    {suffix}"
+
+    # The prompts leave no echo (the session uses erase_when_done): a queued
+    # message is shown explicitly right before its answer instead, keeping the
+    # chat ordered. Stay interactive the WHOLE time the model works (animated
+    # status bar + Esc-to-interrupt); a submitted follow-up is stored in `queued`
+    # and the prompt reopens empty, so it can't be lost by editing/clearing.
+    while worker.is_alive():
+        try:
+            entered = session.prompt(
+                _make_chrome(_live_bar, tip),
+                refresh_interval=0.5,
+            )
+        except (KeyboardInterrupt, EOFError):
+            agent.request_cancel()   # cooperative cancel; stay interactive
+            continue
+
+        if by_worker["flag"]:
+            tail = entered           # worker finished; this is an unsent draft
+            break
+
+        if entered.strip().lower() in ("/empty_queue", "/empty-queue"):
+            console.print(f"  [{C_DARK}]queue cleared[/{C_DARK}]" if queued
+                          else f"  [{C_DARK}]nothing queued[/{C_DARK}]")
+            queued = None
+            continue
+
+        if entered.strip():          # Enter while busy → queue it, reopen empty
+            queued = entered.strip()
+            if not notified:
+                console.print(f"  [{C_DARK}]↩ queued — sent once the current answer "
+                              f"is ready[/{C_DARK}]")
+                notified = True
+            # First queue this session: surface how to cancel it, in the tip row.
+            if not _queue_tip_shown:
+                tip = _QUEUE_TIP
+                _queue_tip_shown = True
+
+    worker.join()  # near-instant: worker has finished or is closing the prompt
+    if agent.is_cancelled():
+        return holder.get("resp"), holder.get("err"), "", False, True
+    if queued:
+        return holder.get("resp"), holder.get("err"), queued, True, False
+    return holder.get("resp"), holder.get("err"), tail, False, False
 
 
 # ── Trace display ──────────────────────────────────────────────────────
@@ -610,14 +1054,20 @@ def main():
     args = parser.parse_args()
 
     status = StatusLine()
+    # Shared with the type-ahead toolbar: StatusLine.update() no-ops when the
+    # Rich Live region isn't started, so these callbacks are safe in both modes.
+    status_text = {"main": "", "detail": "", "stats": ""}
 
     def on_status(msg: str):
+        status_text["main"] = msg
         status.update(msg)
 
     def on_detail(msg: str):
+        status_text["detail"] = msg
         status.detail(msg)
 
     def on_stats(msg: str):
+        status_text["stats"] = msg
         status.stats(msg)
 
     from .agent import LongevityClawAgent
@@ -656,15 +1106,13 @@ def main():
     def _(event):
         buf = event.current_buffer
         if not buf.text:
+            # Empty input while the model is working → interrupt the request.
+            if agent.is_generating():
+                agent.request_cancel()
             return
         _paste_store.clear()
         _paste_counter[0] = 0
         buf.reset()
-
-    def _bottom_toolbar():
-        return HTML(f"<style fg='{C_DARK}'>Esc</style> clear  "
-                     f"<style fg='{C_DARK}'>Ctrl-C</style> interrupt  "
-                     f"<style fg='{C_DARK}'>Tab</style> complete")
 
     @kb.add("backspace")
     def _(event):
@@ -725,7 +1173,10 @@ def main():
         complete_while_typing=True,
         key_bindings=kb,
         input_processors=[PasteCollapseProcessor()],
-        bottom_toolbar=_bottom_toolbar,
+        # Keep the input area "locked": every prompt erases its rendered chrome
+        # (bar + tip + input) on submit, so the separator never piles up in the
+        # scrollback. The submitted message is echoed as a plain "you> …" line.
+        erase_when_done=True,
         style=PTStyle.from_dict({
             "prompt": f"bold {C_MID}",
             "completion-menu": f"bg:#0a1a1e {C_MID}",
@@ -734,14 +1185,24 @@ def main():
             "completion-menu.meta.completion": f"bg:#0a1a1e {C_DARK} italic",
             "completion-menu.meta.completion.current": f"bg:{C_BRIGHT} {C_DEEP} italic",
             "paste-collapsed": f"{C_DARK} italic",
-            "bottom-toolbar": f"bg:#0a1a1e {C_DARK}",
+            # Prompt chrome: bright separator/status bar, dim tip row, input label
+            "statusbar": f"{C_BRIGHT} bold",
+            "tip": f"{C_DARK} italic",
+            "you": f"bold {C_MID}",
         }),
     )
+
+    pending = None          # a ready-to-send message captured during type-ahead
+    pending_default = ""    # an unfinished draft to pre-fill the next prompt
 
     while True:
         try:
             console.print()
-            if demo_queue:
+            demo_echoed = False
+            if pending is not None:
+                user_input = pending
+                pending = None
+            elif demo_queue:
                 demo_text = demo_queue.pop(0)
                 sys.stdout.write(f"\033[1;38;2;59;193;168myou>\033[0m ")
                 sys.stdout.flush()
@@ -753,9 +1214,11 @@ def main():
                 sys.stdout.write("\n")
                 sys.stdout.flush()
                 user_input = demo_text
+                demo_echoed = True
             else:
                 user_input = session.prompt(
-                    HTML(f"<b><style fg='{C_MID}'>you&gt;</style></b> "),
+                    _make_chrome(lambda: _idle_bar_text(agent.effort), _pick_tip()),
+                    default=pending_default,
                 ).strip()
                 user_input = PASTE_MARKER_RE.sub(
                     lambda m: _paste_store.pop(int(m.group(1)), ""),
@@ -763,9 +1226,11 @@ def main():
                 )
                 _paste_counter[0] = 0
                 _paste_store.clear()
+            pending_default = ""
         except KeyboardInterrupt:
             _paste_store.clear()
             _paste_counter[0] = 0
+            pending_default = ""
             continue
         except EOFError:
             console.print(f"\n[{C_BRIGHT}]Stay young![/{C_BRIGHT}]")
@@ -773,6 +1238,12 @@ def main():
 
         if not user_input:
             continue
+
+        # The prompt erased its own chrome — echo the message into the scrollback
+        # as a plain "you> …" line so the history stays clean and ordered. (Demo
+        # mode already printed it via the typing animation.)
+        if not demo_echoed:
+            console.print(f"[bold {C_MID}]you>[/bold {C_MID}] {user_input}")
 
         # ── Handle slash commands ──────────────────────────────────
         if user_input.startswith("/"):
@@ -806,6 +1277,80 @@ def main():
                     console.print(f"    [{C_MID}]{mod:20s}[/{C_MID}] {n:>4d}  [{C_BRIGHT}]{bar}[/{C_BRIGHT}]")
                 continue
 
+            elif cmd == "/skills":
+                from .skills import list_skills
+                saved = list_skills()
+                if not saved:
+                    console.print(f"[{C_DARK}]  no skills saved yet — finish a task, then say "
+                                  f"'save this as a skill'[/{C_DARK}]")
+                else:
+                    console.print(f"[bold]  {len(saved)} saved skill{'s' if len(saved) != 1 else ''}:[/bold]")
+                    for s in saved:
+                        console.print(f"    [{C_MID}]/{s['slug']}[/{C_MID}]  [{C_DARK}]{s['description']}[/{C_DARK}]")
+                continue
+
+            elif cmd == "/allowed":
+                from . import fs_access
+                console.print(f"[bold]  filesystem policy:[/bold] [{C_MID}]{fs_access.get_policy()}[/{C_MID}]")
+                console.print(f"[{C_DARK}]  the agent may access:[/{C_DARK}]")
+                for root in fs_access.get_allowed_roots():
+                    console.print(f"    [{C_MID}]{root}[/{C_MID}]")
+                continue
+
+            elif cmd == "/grant":
+                from . import fs_access
+                parts = user_input.split(maxsplit=1)
+                if len(parts) < 2:
+                    console.print(f"[{C_DARK}]  usage: /grant <path>[/{C_DARK}]")
+                    continue
+                target = Path(parts[1].strip().strip('"\'')).expanduser()
+                if not target.exists():
+                    console.print(f"[{C_DARK}]  no such path: {target}[/{C_DARK}]")
+                    continue
+                granted = fs_access.grant_path(target)
+                console.print(f"[{C_MID}]  granted access:[/{C_MID}] {granted}")
+                continue
+
+            elif cmd == "/loop":
+                rest = user_input[len("/loop"):].strip()
+                interval, task = _parse_loop_args(rest) if rest else (0, "")
+                if not task:
+                    console.print(f"[{C_DARK}]  usage: /loop [freq] <task> — e.g. "
+                                  f"/loop 30m check PubMed for new GrimAge papers[/{C_DARK}]")
+                    continue
+                _run_loop(agent, task, interval, status, _stream_enabled)
+                continue
+
+            elif cmd == "/empty_queue":
+                console.print(f"[{C_DARK}]  queue cleared[/{C_DARK}]" if pending
+                              else f"[{C_DARK}]  nothing queued[/{C_DARK}]")
+                pending = None
+                continue
+
+            elif cmd == "/effort":
+                from .agent import EFFORT_LEVELS
+
+                def _cap_str(lvl):
+                    cap = EFFORT_LEVELS[lvl]
+                    return "unlimited" if cap is None else f"{cap} tool calls/response"
+
+                parts = user_input.split(maxsplit=1)
+                if len(parts) > 1:
+                    lvl = parts[1].strip().lower()
+                    if agent.set_effort(lvl):
+                        console.print(f"[{C_MID}]  effort: {lvl}[/{C_MID}] [{C_DARK}]({_cap_str(lvl)})[/{C_DARK}]")
+                    else:
+                        console.print(f"[{C_DARK}]  usage: /effort low|medium|high|max[/{C_DARK}]")
+                else:
+                    console.print(f"[{C_MID}]  effort: {agent.effort}[/{C_MID}] [{C_DARK}]({_cap_str(agent.effort)})[/{C_DARK}]")
+                    console.print(f"[{C_DARK}]  set with: /effort low (5) · medium (10) · high (20) · max (unlimited)"
+                                  f" — skills bypass the cap[/{C_DARK}]")
+                continue
+
+            elif cmd == "/usage":
+                _show_usage(agent)
+                continue
+
             elif cmd == "/save":
                 parts = user_input.split(maxsplit=1)
                 filename = parts[1] if len(parts) > 1 else None
@@ -818,9 +1363,63 @@ def main():
                     _render_trace(trace)
                 continue
 
-            else:
-                console.print(f"[{C_DARK}]  unknown command: {cmd} (try /help)[/{C_DARK}]")
+            elif cmd == "/l_llm":
+                from .llm_client import (
+                    query_llm, get_current_backend, get_local_engine, is_local_backend,
+                )
+                rest = user_input[len("/l_llm"):].strip()
+                # Optional explicit override; otherwise decide from context.
+                force = None
+                first, _, tail = rest.partition(" ")
+                fl = first.lower()
+                if fl in ("--think", "--thinking", "think:", "+think"):
+                    force, rest = True, tail.strip()
+                elif fl in ("--no-think", "--nothink", "no-think:", "nothink:", "-think"):
+                    force, rest = False, tail.strip()
+                if not rest:
+                    console.print(f"[{C_DARK}]  usage: /l_llm [--think|--no-think] <question>[/{C_DARK}]")
+                    continue
+                think, why = _llm_decide_thinking(rest) if force is None else (force, "forced")
+                engine = get_local_engine() if is_local_backend() else get_current_backend()
+                console.print(
+                    f"[{C_DARK}]  L-LLM · thinking {'on' if think else 'off'} ({why}) · {engine}[/{C_DARK}]"
+                )
+                if think and is_local_backend() and get_local_engine() == "llamacpp":
+                    console.print(
+                        f"[{C_DARK}]  note: this GGUF has no reasoning delimiter — the reply will "
+                        f"include its reasoning trace[/{C_DARK}]"
+                    )
+                try:
+                    with console.status(f"[{C_DARK}]querying L-LLM…[/{C_DARK}]", spinner="dots"):
+                        resp = query_llm(
+                            rest,
+                            system_prompt=_LLLM_SYSTEM_PROMPT,
+                            max_tokens=_LLLM_MAX_TOKENS_THINK if think else _LLLM_MAX_TOKENS_FAST,
+                            temperature=0.0,
+                            enable_thinking=think,
+                        )
+                except Exception as e:
+                    console.print(f"[bold {C_DEEP}]error>[/bold {C_DEEP}] L-LLM query failed: {e}")
+                    continue
+                console.print(Markdown(resp.content.strip() or "_(empty response)_"))
+                u = resp.usage or {}
+                it = u.get("prompt_tokens", u.get("input_tokens", 0))
+                ot = u.get("completion_tokens", u.get("output_tokens", 0))
+                console.print(f"[{C_DARK}]  {resp.model} · {it}+{ot} tok[/{C_DARK}]")
                 continue
+
+            else:
+                # Not a built-in command — maybe it's a saved skill (/<slug>)
+                from .skills import get_skill
+                skill = get_skill(cmd[1:])
+                if skill:
+                    rest = user_input[len(cmd):].strip()
+                    user_input = (f"Run my saved skill '{skill['name']}'."
+                                  + (f" Inputs: {rest}" if rest else ""))
+                    # fall through to chat — the agent will call run_skill
+                else:
+                    console.print(f"[{C_DARK}]  unknown command: {cmd} (try /help or /skills)[/{C_DARK}]")
+                    continue
 
         # ── Handle quit without slash ──────────────────────────────
         if user_input.lower() in ("quit", "exit", "q"):
@@ -829,6 +1428,32 @@ def main():
 
         # ── Chat with agent ────────────────────────────────────────
         _request_count += 1
+
+        # Type-ahead: while the model works, let the user compose the next
+        # message. Disabled in demo mode and when streaming is turned off.
+        if _stream_enabled and not demo_queue:
+            response, err, next_text, submitted, interrupted = _chat_with_typeahead(
+                agent, user_input, session, status_text)
+            if interrupted:
+                console.print(f"\n  [dim italic]Interrupted by user[/dim italic]")
+            elif err is not None:
+                console.print(f"\n[bold {C_DEEP}]error>[/bold {C_DEEP}] {err}")
+            elif response is not None:
+                console.print()
+                _stream_response(response)
+                _print_tool_hint(agent, _request_count)
+
+            clean = PASTE_MARKER_RE.sub(
+                lambda m: _paste_store.pop(int(m.group(1)), ""), next_text or "")
+            _paste_counter[0] = 0
+            _paste_store.clear()
+            if clean.strip():
+                if submitted:
+                    pending = clean.strip()          # send it next, in order
+                else:
+                    pending_default = clean          # restore the draft
+            continue
+
         try:
             status.start()
             response = agent.chat(user_input)
@@ -844,16 +1469,10 @@ def main():
                     border_style=C_DEEP,
                     padding=(1, 2),
                 ))
-
-            if agent.traces:
-                last_trace = agent.traces[-1]
-                n_tools = sum(len(r["tool_calls"]) for r in last_trace["rounds"])
-                if n_tools > 0:
-                    hint = "  /showwhy for details" if _request_count <= 3 else ""
-                    console.print(f"  [dim]{n_tools} tool{'s' if n_tools != 1 else ''} used ·{hint}[/dim]")
+            _print_tool_hint(agent, _request_count)
         except KeyboardInterrupt:
             status.stop()
-            console.print(f"\n[{C_DARK}]interrupted[/{C_DARK}]")
+            console.print(f"\n  [dim italic]Interrupted by user[/dim italic]")
         except Exception as e:
             status.stop()
             console.print(f"\n[bold {C_DEEP}]error>[/bold {C_DEEP}] {e}")

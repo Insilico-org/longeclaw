@@ -71,3 +71,6 @@ htmlcov/
 
 # Claude Code
 .claude/
+
+# agent workspace (runtime files)
+workspace/

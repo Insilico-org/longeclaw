@@ -57,6 +57,10 @@ Three population-scale datasets for individual interpretation (z-scores, percent
 
 **PubMed search.** Search biomedical literature directly from the conversation via NCBI E-utilities.
 
+**Workspace files.** Read text files, and -- in the local CLI -- write and edit files to save reports or exports. By default access is confined to two folders: `workspace/` (where relative paths resolve) and `skills/`. Grant the agent access to other locations on demand with `/grant <path>` (or set `LONGEVITYCLAW_ALLOWED`). The policy is configurable (`readwrite` / `readonly` / `off`); the hosted web app runs with filesystem tools disabled.
+
+**Skills.** Save a procedure you just ran as a named, reusable skill, then replay it later by typing `/<skill-name>`. Skills are stored as `skills/<name>/SKILL.md` and are prompt recipes -- replaying one re-runs the steps against fresh inputs.
+
 ## Scientific Analysis Modules
 
 Three new research modules for longevity biology analysis:
@@ -125,7 +129,7 @@ you> discover targets for inflammation and senescence       # specific hallmarks
 you> find novel druggable targets in mitochondrial dysfunction
 ```
 
-**Tool:** `discover_novel_targets` with parameters:
+**Tool:** `discover_targets` with parameters:
 - `hallmarks` — list of hallmarks to analyze (default: all 14)
 - `num_runs` — generation runs for consensus (default: 1)
 - `parallel` — enable parallel processing (default: true)
@@ -181,24 +185,40 @@ cp .env.example .env
 | `ANTHROPIC_FOUNDRY_ENDPOINT` | Yes* | Azure Foundry endpoint (alternative to direct API) |
 | `ANTHROPIC_FOUNDRY_API_KEY` | Yes* | Azure Foundry API key |
 | `HF_TOKEN` | No | HuggingFace token for L-LLM inference endpoints |
-| `LLM_BACKEND` | No | Set to `vllm` for local vLLM server |
-| `VLLM_ENDPOINT` | No | Local vLLM server URL |
-| `VLLM_MODEL` | No | Model name served by vLLM |
-| `VLLM_API_KEY` | No | Optional auth for vLLM |
+| `LLM_BACKEND` | No | L-LLM backend: `hf` (default), `local`, `vllm`, or `llamacpp` |
+| `LOCAL_ENGINE` | No | Engine for `LLM_BACKEND=local`: `vllm` (default) or `llamacpp` |
+| `VLLM_ENDPOINT` | No | Self-hosted server URL (alias: `LOCAL_ENDPOINT`) |
+| `VLLM_MODEL` | No | Served-model-name (vLLM) / `--alias` (llama.cpp) |
+| `VLLM_API_KEY` | No | Optional bearer token (only if server set `--api-key`) |
+| `LOCAL_EXTRA_BODY` | No | Extra sampling params merged into each local request (JSON) |
 
 *Either `ANTHROPIC_API_KEY` or `ANTHROPIC_FOUNDRY_*` required.
 
-**Local vLLM Backend:**
+**Local L-LLM Backend (vLLM or llama.cpp):**
 
-For running with a local vLLM server instead of HuggingFace endpoints:
+Serve the longevity model behind an OpenAI-compatible API and point the client at
+it, instead of using a HuggingFace endpoint. Two engines are supported; they
+differ only in how reasoning is disabled, which the client handles for you:
 
 ```bash
-# Configure in .env
-LLM_BACKEND=vllm
-VLLM_ENDPOINT=http://your-server:8770
-VLLM_MODEL=your-model-name
-VLLM_API_KEY=your-optional-api-key
+# Official bf16 weights on vLLM (honours the enable_thinking switch)
+LLM_BACKEND=local
+LOCAL_ENGINE=vllm
+VLLM_ENDPOINT=http://localhost:8000
+VLLM_MODEL=longevity-llm            # must match --served-model-name
+
+# Quantized GGUF on llama.cpp (uses the Qwen /no_think soft switch)
+LLM_BACKEND=local
+LOCAL_ENGINE=llamacpp
+VLLM_ENDPOINT=http://localhost:8011
+VLLM_MODEL=teacher                  # must match --alias
 ```
+
+`LLM_BACKEND=vllm` and `LLM_BACKEND=llamacpp` are shorthands that pin the engine
+without a separate `LOCAL_ENGINE`. The API key is optional — set `VLLM_API_KEY`
+only if the server was started with `--api-key`. A repetition penalty of 1.1 is
+sent by default (the model loops without it); add `top_p`/`top_k`/etc. via
+`LOCAL_EXTRA_BODY`.
 
 **Batch Target Discovery Scripts:**
 
@@ -300,9 +320,11 @@ you> what role does g@FOXO3 play in aging?
 you> train a model on inflammatory response genes in blood
 ```
 
-Autocomplete: `@` for file paths, `g@` for gene names, `cl@` for clock names, `/` for commands.
+Autocomplete: `@` for file paths, `g@` for gene names, `cl@` for clock names, `/` for commands and saved skills.
 
-Commands: `/help`, `/clocks`, `/save`, `/showwhy` (agent reasoning trace), `/clear`, `/model`, `/quit`.
+Commands: `/help`, `/clocks`, `/skills`, `/allowed`, `/grant <path>`, `/loop [freq] <task>`, `/effort low|medium|high|max`, `/usage`, `/save`, `/showwhy` (agent reasoning trace), `/clear`, `/model`, `/quit`. Invoke a saved skill with `/<skill-name>`. `/loop` repeats a request on a timer (e.g. `/loop 30m check PubMed for new GrimAge papers`) until Ctrl-C. `/effort` caps how many tools the agent may call per response (low 5, medium 10, high 20, max unlimited) to control latency — skills bypass the cap. `/usage` shows session token/model/tool/skill usage.
+
+**Type-ahead:** while the agent is working on your question, you can start typing the next one -- it is held and sent automatically once the current answer is rendered, so you never have to wait on the model to compose a follow-up. Press **Esc** (or Ctrl-C) to interrupt a running request; it stops at the next step and shows "Interrupted by user".
 
 ## Configuration
 

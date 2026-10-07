@@ -17,7 +17,7 @@ No test suite exists. No linter is configured.
 
 ## Environment
 
-Requires `ANTHROPIC_API_KEY` in `.env` (loaded automatically). Optional: `ANTHROPIC_MODEL`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_FOUNDRY_ENDPOINT`, `ANTHROPIC_FOUNDRY_API_KEY`.
+Requires `ANTHROPIC_API_KEY` in `.env` (loaded automatically). Optional: `ANTHROPIC_MODEL`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_FOUNDRY_ENDPOINT`, `ANTHROPIC_FOUNDRY_API_KEY`, `LONGEVITYCLAW_FS` (filesystem policy: `readwrite`/`readonly`/`off`, default `readwrite`), `LONGEVITYCLAW_WORKSPACE` (primary workspace dir, default `<repo>/workspace`), `LONGEVITYCLAW_ALLOWED` (os.pathsep-separated extra allowed paths), `LONGEVITYCLAW_EFFORT` (tool-call budget per response: low/medium/high/max, default high), `LONGEVITYCLAW_CACHE_TTL` (Anthropic prompt-cache TTL: `5m`/`1h`, default `5m` — 5m is cheaper for rapid tool loops, 1h survives long between-turn pauses; ignored for non-Anthropic models).
 
 ## Architecture
 
@@ -40,7 +40,9 @@ The system is an agent loop where Claude calls 21+ domain tools (including pathw
 | `gene_lookup.py` | Singleton `GeneLookup` wrapping MyGene.info via biothings_client with persistent SQLite cache (211 MB). Lazy — client created on first query. Returns name, summary, GO terms, Reactome pathways, aliases |
 | `pathway_generator.py` | Pathway analysis tools: rank pathways by clock correlation, find synergies, generate hypotheses, discover aging modules, identify intervention targets |
 | `pubmed.py` | NCBI E-utilities esearch+efetch. No API key needed |
-| `cli.py` | Rich + prompt_toolkit UI. `@` file autocomplete, `g@` gene autocomplete, `cl@` clock autocomplete, `/` commands. Three-line live status display |
+| `fs_access.py` | Filesystem access policy. `LONGEVITYCLAW_FS` tier (`readwrite`/`readonly`/`off`) + workspace confinement via `resolve_in_workspace()` (rejects `..`/symlink escapes). Backs `read_file`/`list_dir`/`write_file`/`edit_file` |
+| `skills.py` | User-defined repeatable procedures. Each skill is `skills/<slug>/SKILL.md` (frontmatter + instructions). `save_skill`/`list_skills`/`get_skill`/`delete_skill`. Prompt skills: `run_skill` returns instructions for the agent to follow with fresh inputs |
+| `cli.py` | Rich + prompt_toolkit UI. `@` file autocomplete, `g@` gene autocomplete, `cl@` clock autocomplete, `/` commands + `/<skill-slug>`. Three-line live status display. Type-ahead: `_chat_with_typeahead()` runs `agent.chat()` in a worker thread while the user composes the next message; thread-safe `app.exit()` closes the live prompt when generation completes |
 | `web/server.py` | FastAPI + WebSocket. Spawns CLI in a PTY, bridges to xterm.js in browser. Password auth with 24h session tokens. File upload to `data/uploads/` |
 
 ### Key patterns
@@ -67,13 +69,21 @@ When `--password` is set, the server stores a SHA-256 hash. `POST /api/auth` val
 - `data/mygene_cache.sqlite` — Pre-populated MyGene.info HTTP response cache (211 MB)
 - `data/msigdb/` — MSigDB v2025.1 gene set JSONs: hallmarks (50), Reactome (1787), KEGG (658), cancer (1006)
 - `data/uploads/` — Web UI file uploads (gitignored)
+- `skills/` — Saved skills, one directory per skill containing `SKILL.md` (created on first `save_skill`)
+
+### Filesystem & skills
+
+- **Workspace confinement:** every agent file path goes through `fs_access.resolve_in_workspace()`, which resolves the path (collapsing `..` and symlinks) and checks it against `fs_access.get_allowed_roots()`. By default the allowed roots are `<repo>/workspace` (where relative paths resolve, overridable via `LONGEVITYCLAW_WORKSPACE`) and `<repo>/skills`. Extra roots come from `LONGEVITYCLAW_ALLOWED` (static) or `fs_access.grant_path()` (runtime).
+- **Runtime grants:** `grant_path()`/`revoke_path()` add/remove allowed locations for the process lifetime — the hook for future interactive "approve access?" prompts. The CLI exposes them as `/grant <path>` and `/allowed`.
+- **Policy tiers:** `read_file`/`list_dir` need `can_read()` (readwrite or readonly); `write_file`/`edit_file`/`save_skill` need `can_write()` (readwrite only). The web server sets `LONGEVITYCLAW_FS=off` when forking the PTY, so hosted sessions get no filesystem tools.
+- **Skills are prompt recipes:** `run_skill` loads a `SKILL.md` body back into the conversation and the agent re-executes the steps against current inputs — it does not replay a frozen tool-call sequence.
 
 ### Adding a new tool
 
 1. Add handler function `tool_<name>()` in `tools.py`
-2. Add schema to the list in `get_tool_definitions()` (same file)
-3. Add handler to dict in `get_tool_handlers()` (same file)
-4. Add friendly label in `agent.py:TOOL_LABELS`
+2. Add a dict (`name`, `description`, `input_schema`, `handler`) to the module-level `TOOLS` list in `tools.py` — `get_tool_definitions()`/`get_tool_handlers()` derive from it
+3. Add friendly label in `agent.py:TOOL_LABELS`
+4. If the tool surfaces a new capability, mention it in `agent.py:SYSTEM_PROMPT`
 
 ### Entry points (pyproject.toml)
 

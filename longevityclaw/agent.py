@@ -41,6 +41,10 @@ You can also search **PubMed** for biomedical literature — use this when users
 
 You have access to **genomic annotation tools**: look up CpG sites by ID, chromosome, gene, or regulatory region (promoter, body, enhancer, CpG island); query authoritative gene function, GO terms, and Reactome pathways from MyGene.info; and run **Gene Set Enrichment Analysis** (preranked GSEA) on ranked feature lists against MSigDB collections (50 hallmark pathways, 1787 Reactome, 658 KEGG, 1006 cancer gene sets).
 
+You also have **workspace file tools**: read_file and list_dir to read text files (a notes file, a script, a data file you want to inspect as text — not only omics CSVs); write_file and edit_file to save reports, exports, or scripts. By default file access is confined to two directories — the workspace/ folder (where relative paths resolve) and the skills/ folder. If a path is outside these, the tool refuses it and names the allowed directories: do NOT retry the same path — instead tell the user the location is not accessible and that they can grant access with "/grant <path>". Likewise, if a write is refused because the policy is read-only or off, say so rather than retrying. For running aging clocks on an omics CSV, still use predict_age_from_file (not read_file).
+
+You can also create and replay **skills** — reusable procedures the user can invoke by name. When the user asks to "save this as a skill", "remember how to do this", or "make this repeatable", call save_skill with generalized step-by-step instructions (refer to the tools and inputs each step needs, not a transcript of one specific run). Use list_skills to show saved skills and run_skill to load and follow a skill's instructions when the user invokes it (e.g. types /skill-name).
+
 ## Your Capabilities
 1. **Clock encyclopedia**: Explain any clock -- what it measures, how it works, its key features, its strengths and limitations, and the original publication.
 2. **Feature deep-dive**: Look up any CpG site, gene, or protein across all clocks. Explain its role in aging and which clocks weight it most heavily.
@@ -131,15 +135,57 @@ TOOL_LABELS = {
     "forget": "forgetting user info",
     "recall": "recalling user memory",
     "query_longevity_llm": "querying L-LLM (Longevity LLM)",
-    "discover_novel_targets": "discovering novel targets (6D scoring)",
+    "discover_targets": "discovering novel targets (6D scoring)",
     "validate_targets": "validating targets via OpenTargets",
+    "read_file": "reading file",
+    "list_dir": "listing directory",
+    "write_file": "writing file",
+    "edit_file": "editing file",
+    "save_skill": "saving skill",
+    "list_skills": "listing skills",
+    "run_skill": "running skill",
 }
 
 
+# Effort levels: max tool calls the agent may make for a single normal chat
+# response (None = unlimited). Skills bypass the cap once invoked.
+EFFORT_LEVELS = {"low": 5, "medium": 10, "high": 20, "max": None}
+DEFAULT_EFFORT = "high"
+
 # Context management constants
-MAX_CONTEXT_CHARS = 400_000  # ~100K tokens, safe for 200K context window
+# The emergency client-side trim threshold is derived per-model from the real
+# context window (see _resolve_context_budget): we keep history up to ~70% of the
+# window, then trim. Trimming rewrites history mid-prefix and invalidates prompt
+# caches, so it should fire rarely. These are only fallbacks for when the Models
+# API can't tell us the window (offline, or a non-Anthropic backend).
+DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000   # conservative: err low for unknown models
+_KNOWN_CONTEXT_WINDOWS = {                 # prefix-matched against the model id
+    "claude-opus-4-8": 1_000_000, "claude-opus-4-7": 1_000_000,
+    "claude-opus-4-6": 1_000_000, "claude-opus-4-5": 200_000,
+    "claude-sonnet-4-6": 1_000_000, "claude-haiku-4-5": 200_000,
+}
+# chars-budget ≈ window_tokens × this (≈70% of window; ~3.5 real chars/token).
+_CONTEXT_TRIM_FACTOR = 2.5
 TRUNCATE_AFTER_ROUNDS = 3    # keep last N assistant+tool rounds intact
 TOOL_RESULT_SUMMARY_LEN = 200  # chars to keep from truncated tool results
+
+# Anthropic prompt-cache write cost premium over base input, by TTL (per Anthropic
+# pricing): a 5-minute cache write costs 1.25× base input (premium 0.25); a 1-hour
+# write costs 2.0× (premium 1.0). _CACHE_TTL is the single source of truth — the
+# cache_control marker and the /usage savings estimate both read it, so the
+# displayed "tokens saved" can never drift from the TTL we actually request.
+#
+# User-selectable via LONGEVITYCLAW_CACHE_TTL ("5m" or "1h"; default 5m). 5m
+# minimizes write cost during rapid agentic loops (cheap 1.25× writes that never
+# expire mid-loop); 1h survives long between-turn reading pauses, so follow-ups
+# read the cached prefix at 0.1× instead of re-writing it. Which wins is
+# workload-dependent — A/B the same flow under each and compare /usage's "saved".
+# An unknown value falls back to 5m. (Read once at import; set it in .env.)
+_CACHE_WRITE_PREMIUM_BY_TTL = {"5m": 0.25, "1h": 1.0}
+_env_cache_ttl = os.environ.get("LONGEVITYCLAW_CACHE_TTL", "5m").strip().lower()
+_CACHE_TTL = _env_cache_ttl if _env_cache_ttl in _CACHE_WRITE_PREMIUM_BY_TTL else "5m"
+CACHE_WRITE_PREMIUM = _CACHE_WRITE_PREMIUM_BY_TTL[_CACHE_TTL]
+CACHE_WRITE_MULTIPLIER = 1.0 + CACHE_WRITE_PREMIUM  # 1.25× (5m) or 2.0× (1h)
 
 
 class LongevityClawAgent:
@@ -167,6 +213,27 @@ class LongevityClawAgent:
         self._timer_thread: threading.Thread | None = None
         self._timer_running = False
 
+        # Cooperative cancellation: chat() runs in a worker thread under the CLI's
+        # type-ahead, so SIGINT can't reach it. The UI sets this event (Ctrl-C/Esc)
+        # and chat() returns at the next round boundary instead of blocking.
+        self._cancel = threading.Event()
+        self._generating = False
+
+        # Session-cumulative usage (for /usage), never reset between chat() calls.
+        self.session_usage = {
+            "models": {},   # model name -> {"input", "output", "calls"}
+            "tools": {},    # tool name -> invocation count
+            "skills": {},   # skill name -> run count
+            "cache": {"read": 0, "write": 0},  # cached input tokens (read ~0.1x)
+        }
+
+        # Effort: max tool calls per normal response (None = unlimited). Skills,
+        # once invoked in a response, lift the cap for the rest of that response.
+        env_effort = os.environ.get("LONGEVITYCLAW_EFFORT", DEFAULT_EFFORT).strip().lower()
+        self.effort = env_effort if env_effort in EFFORT_LEVELS else DEFAULT_EFFORT
+        self.tool_budget = EFFORT_LEVELS[self.effort]
+        self._skill_invoked = False  # per-chat: set when run_skill is called
+
         kwargs = {}
         foundry_endpoint = os.environ.get("ANTHROPIC_FOUNDRY_ENDPOINT")
         foundry_key = os.environ.get("ANTHROPIC_FOUNDRY_API_KEY")
@@ -187,12 +254,63 @@ class LongevityClawAgent:
         )
         self.tools = get_tool_definitions()
         self.handlers = get_tool_handlers()
+
+        # Size the emergency trim threshold to THIS model's context window.
+        self.max_context_chars = self._resolve_context_budget()
+
+        # Provider gate for prompt caching: Anthropic models get explicit
+        # cache_control markers; everything else stays generic (relies on the
+        # provider's own automatic prefix caching, which our stable system prompt
+        # already enables). The prefix-stability discipline itself is agnostic.
+        self.provider = "anthropic" if self.model.lower().startswith("claude") else "generic"
         self.messages: list[dict] = []
         self.traces: list[dict] = []  # per-request trace log
 
         self.on_status("loading clock database (233 clocks, 429K coefficients)...")
         get_db()
         self.on_status("ready")
+
+    def request_cancel(self):
+        """Signal the running chat() to stop at the next round boundary."""
+        self._cancel.set()
+
+    def is_generating(self) -> bool:
+        """True while a chat() call is in flight."""
+        return self._generating
+
+    def is_cancelled(self) -> bool:
+        """True if the most recent chat() was cancelled (until the next call)."""
+        return self._cancel.is_set()
+
+    def set_effort(self, level: str) -> bool:
+        """Set the per-response tool-call budget (low/medium/high/max). Returns
+        True if the level is valid."""
+        level = level.strip().lower()
+        if level not in EFFORT_LEVELS:
+            return False
+        self.effort = level
+        self.tool_budget = EFFORT_LEVELS[level]
+        return True
+
+    def _resolve_context_budget(self) -> int:
+        """Chars of conversation to keep before the emergency trimmer fires,
+        sized to the model's real context window. Tries the live Models API
+        first (model-agnostic, authoritative), then a small known-models table
+        (prefix match, so dated ids resolve), then a conservative default."""
+        window = None
+        try:
+            window = getattr(self.client.models.retrieve(self.model),
+                             "max_input_tokens", None)
+        except Exception:
+            window = None
+        if not window:
+            for name, w in _KNOWN_CONTEXT_WINDOWS.items():
+                if self.model.startswith(name):
+                    window = w
+                    break
+        if not window:
+            window = DEFAULT_CONTEXT_WINDOW_TOKENS
+        return int(window * _CONTEXT_TRIM_FACTOR)
 
     def _fmt_tokens(self, n: int) -> str:
         if n >= 1000:
@@ -288,7 +406,7 @@ class LongevityClawAgent:
                     block["content"] = raw[:TOOL_RESULT_SUMMARY_LEN] + f"... [truncated, was {len(raw)} chars]"
 
         # Step 2: if still too large, drop oldest pairs (keep at least last 4 messages)
-        while len(self.messages) > 4 and self._estimate_chars(self.messages) > MAX_CONTEXT_CHARS:
+        while len(self.messages) > 4 and self._estimate_chars(self.messages) > self.max_context_chars:
             # Drop first two messages (user + assistant pair)
             if self.messages[0]["role"] == "user":
                 self.messages.pop(0)
@@ -304,6 +422,79 @@ class LongevityClawAgent:
             else:
                 self.messages.pop(0)
 
+    # ── Prompt caching (provider-specific, isolated here) ──────────────────
+    # Anthropic block-level cache_control is robust across SDK versions (unlike
+    # the top-level kwarg, absent on older SDKs). Everything else is a no-op.
+    #
+    # TTL "5m" (not "1h") on purpose: our usage is write-heavy (agentic tool
+    # loops grow the conversation fast, so each round writes a delta that's read
+    # at most a few times). A 1h write costs 2× base; a 5m write costs 1.25×.
+    # When writes rival reads, the cheaper write wins — and the 5m window never
+    # expires mid-loop (rounds are seconds apart) and survives normal between-turn
+    # pauses. Only a >5min idle gap loses the cache, costing one full-price
+    # re-send before it re-caches. See CACHE_WRITE_PREMIUM below for the cost model.
+    _CACHE_CONTROL = {"type": "ephemeral", "ttl": _CACHE_TTL}
+
+    def _apply_prompt_cache(self, create_kwargs: dict) -> dict:
+        """Apply provider-specific prompt caching to a request, in place.
+
+        Anthropic: a cache_control breakpoint on the system block (anchors
+        tools+system) plus a rolling breakpoint on the last message (extends the
+        cache to the whole conversation prefix). Any other provider: untouched —
+        caching, if the provider has it, is automatic and only needs a stable
+        prefix, which we already maintain.
+        """
+        if self.provider != "anthropic":
+            return create_kwargs
+
+        system = create_kwargs.get("system")
+        if isinstance(system, str) and system:
+            create_kwargs["system"] = [{
+                "type": "text", "text": system, "cache_control": self._CACHE_CONTROL,
+            }]
+        create_kwargs["messages"] = self._messages_with_cache_breakpoint(
+            create_kwargs["messages"])
+        return create_kwargs
+
+    def _messages_with_cache_breakpoint(self, messages: list) -> list:
+        """Return messages with a cache_control breakpoint on the last message's
+        final content block (rolling cache of the conversation prefix). Builds a
+        shallow copy — never mutates the stored messages, so breakpoints don't
+        accumulate across rounds."""
+        if not messages:
+            return messages
+        last = messages[-1]
+        content = last.get("content")
+        if isinstance(content, str) and content:
+            new_content = [{"type": "text", "text": content,
+                            "cache_control": self._CACHE_CONTROL}]
+        elif isinstance(content, list) and content and isinstance(content[-1], dict):
+            new_content = content[:-1] + [{**content[-1],
+                                           "cache_control": self._CACHE_CONTROL}]
+        else:
+            return messages  # can't place a breakpoint here (e.g. SDK block objs)
+        return messages[:-1] + [{**last, "content": new_content}]
+
+    def _with_budget_note(self, messages: list, note: str) -> list:
+        """Append the effort/budget reminder as a text block on the LAST message,
+        on a shallow copy (never mutates stored messages). Keeping this volatile
+        text in the rolling tail — not the system block — means changing /effort or
+        toggling the skill cap leaves the cached system+history prefix byte-stable.
+        Provider-agnostic: runs for every backend, independent of cache markers."""
+        if not messages or not note:
+            return messages
+        last = messages[-1]
+        content = last.get("content")
+        note_block = {"type": "text", "text": note}
+        if isinstance(content, str):
+            new_content = ([{"type": "text", "text": content}, note_block]
+                           if content else [note_block])
+        elif isinstance(content, list):
+            new_content = content + [note_block]
+        else:
+            return messages  # unexpected shape — leave it untouched
+        return messages[:-1] + [{**last, "content": new_content}]
+
     def chat(self, user_message: str) -> str:
         self.messages.append({"role": "user", "content": user_message})
 
@@ -314,6 +505,9 @@ class LongevityClawAgent:
         self._total_tool_time = 0.0
         self._tools_called = []
         self._clocks_computed = 0
+        self._cancel.clear()
+        self._generating = True
+        self._skill_invoked = False
 
         # Trace for this request
         trace = {
@@ -329,6 +523,20 @@ class LongevityClawAgent:
         iteration = 0
         while True:
             iteration += 1
+
+            # Cooperative cancellation point (set by the UI on Ctrl-C / Esc).
+            if self._cancel.is_set():
+                self._stop_thinking_timer()
+                self._generating = False
+                final = "_(interrupted — stopped before completing.)_"
+                trace["final_response"] = final
+                trace["total_input_tokens"] = self._total_input_tokens
+                trace["total_output_tokens"] = self._total_output_tokens
+                trace["total_time"] = self._total_api_time + self._total_tool_time
+                self.traces.append(trace)
+                self.on_status("interrupted")
+                return final
+
             think_label = "thinking" if iteration == 1 else f"thinking (round {iteration})"
             self._manage_context()
             self._start_thinking_timer(think_label)
@@ -338,22 +546,73 @@ class LongevityClawAgent:
             memory_context = memory.get_context_prompt()
             system_prompt = SYSTEM_PROMPT + memory_context if memory_context else SYSTEM_PROMPT
 
+            # Build the request provider-neutrally (plain string system, plain
+            # messages). Provider-specific prompt caching is applied by the single
+            # gated hook _apply_prompt_cache() just before the call.
+            create_kwargs = {
+                "model": self.model,
+                "max_tokens": 16384,
+                "messages": self.messages,
+            }
+            # Effort cap: state the per-response tool budget as text the model
+            # self-counts against (the hard cap is still enforced by the mid-round
+            # stub in the tool loop). Skills lift the cap entirely.
+            #
+            # The note lives in the rolling MESSAGE tail, never in the system block:
+            # its text changes with /effort and toggles on/off per skill, and the
+            # system block anchors the whole cached prefix — so putting it there
+            # would invalidate tools+system+history on every effort change or skill
+            # call. In the tail (rewritten each round anyway) it costs ~nothing and
+            # keeps the cached prefix byte-stable. This discipline is provider-
+            # agnostic; it helps any backend's prefix cache.
+            capped = self.tool_budget is not None and not self._skill_invoked
+            budget_note = ""
+            if capped:
+                budget_note = (
+                    f"TOOL-CALL BUDGET: limit this response to {self.tool_budget} tool "
+                    f"call(s) total (effort '{self.effort}'). Count the tool calls you have "
+                    f"already made in this response and stop before exceeding the budget; pick "
+                    f"the most informative tools first. Running a saved skill lifts this cap."
+                )
+                if self.tool_budget - len(self._tools_called) > 0:
+                    create_kwargs["tools"] = self.tools
+                # else: budget spent → withhold tools so the model answers with what it has
+            else:
+                create_kwargs["tools"] = self.tools
+            create_kwargs["system"] = system_prompt
+            create_kwargs["messages"] = self._with_budget_note(
+                create_kwargs["messages"], budget_note)
+
+            # Provider-specific prompt caching (no-op for non-Anthropic models).
+            self._apply_prompt_cache(create_kwargs)
+
             t0 = time.time()
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=16384,
-                system=system_prompt,
-                tools=self.tools,
-                messages=self.messages,
-            )
+            response = self.client.messages.create(**create_kwargs)
             elapsed = time.time() - t0
             self._stop_thinking_timer()
 
             # Track tokens
             self._total_api_time += elapsed
             if hasattr(response, "usage") and response.usage:
-                self._total_input_tokens += response.usage.input_tokens
+                # NOTE: usage.input_tokens is the UNCACHED remainder only; cached
+                # tokens are reported separately (absent on backends without
+                # caching, hence getattr). True input = input + read + write — and
+                # under aggressive caching input_tokens collapses to ~single digits,
+                # so the status-bar "↑" must use the true total or it reads near 0.
+                cr = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+                cw = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+                self._total_input_tokens += response.usage.input_tokens + cr + cw
                 self._total_output_tokens += response.usage.output_tokens
+                m = self.session_usage["models"].setdefault(
+                    self.model, {"input": 0, "output": 0, "calls": 0,
+                                 "cache_read": 0, "cache_write": 0})
+                m["input"] += response.usage.input_tokens
+                m["output"] += response.usage.output_tokens
+                m["calls"] += 1
+                m["cache_read"] += cr
+                m["cache_write"] += cw
+                self.session_usage["cache"]["read"] += cr
+                self.session_usage["cache"]["write"] += cw
 
             self.on_status(f"got response ({elapsed:.1f}s, {self._fmt_tokens(response.usage.output_tokens if response.usage else 0)} tokens)")
             self._update_stats()
@@ -390,22 +649,50 @@ class LongevityClawAgent:
 
                 self.on_status(f"done ({self._total_api_time:.1f}s)")
                 self._update_stats()
+                self._generating = False
                 return final
 
             # Handle tool calls
             tool_results = []
             n_tools = len(tool_blocks)
-            tool_names_this_round = [b.name for b in tool_blocks]
 
-            for i, block in enumerate(response.content):
+            tool_no = 0
+            for block in response.content:
                 if block.type != "tool_use":
                     continue
+                # Count only tool blocks (response.content also holds text blocks),
+                # so the "[k/n]" status can't overflow.
+                tool_no += 1
+
+                # A skill invocation lifts the tool-call cap for the rest of this
+                # response — skills are explicit, user-requested procedures.
+                if block.name == "run_skill":
+                    self._skill_invoked = True
 
                 label = TOOL_LABELS.get(block.name, block.name)
-                if n_tools > 1:
-                    self.on_status(f"[{i+1}/{n_tools}] {label}...")
-                else:
-                    self.on_status(f"{label}...")
+                # Surface the target path for file operations.
+                if block.name in ("read_file", "write_file", "edit_file", "list_dir"):
+                    target = block.input.get("file_path") or block.input.get("dir_path")
+                    if target:
+                        label = f"{label}: {target}"
+                prefix = f"[{tool_no}/{n_tools}] " if n_tools > 1 else ""
+
+                # Enforce the effort cap even within a single round: if the budget
+                # is already spent, don't run further tools — return a stub result.
+                if (self.tool_budget is not None and not self._skill_invoked
+                        and len(self._tools_called) >= self.tool_budget):
+                    self.on_status(f"{prefix}{label} — skipped (tool budget reached)")
+                    stub = json.dumps({"error": "Tool-call budget reached for this "
+                                       "response; not executed. Answer with what you have."})
+                    round_trace["tool_calls"].append({
+                        "name": block.name, "input": block.input,
+                        "result": stub, "duration": 0.0, "error": True,
+                    })
+                    tool_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": stub, "is_error": True,
+                    })
+                    continue
 
                 handler = self.handlers.get(block.name)
                 if handler:
@@ -417,9 +704,13 @@ class LongevityClawAgent:
                         if block.name in ("train_hallmark_model", "train_custom_model"):
                             set_train_progress(self.on_detail)
 
+                        # Keep the status alive with an elapsed counter while the
+                        # tool runs (some calls — L-LLM, OpenTargets — are slow).
+                        self._start_thinking_timer(f"{prefix}{label}")
                         t1 = time.time()
                         result = handler(**block.input)
                         dt = time.time() - t1
+                        self._stop_thinking_timer()
 
                         set_predict_progress(None)
                         set_individual_progress(None)
@@ -428,8 +719,14 @@ class LongevityClawAgent:
 
                         self._total_tool_time += dt
                         self._tools_called.append(block.name)
+                        self.session_usage["tools"][block.name] = (
+                            self.session_usage["tools"].get(block.name, 0) + 1)
+                        if block.name == "run_skill":
+                            sk = block.input.get("name", "?")
+                            self.session_usage["skills"][sk] = (
+                                self.session_usage["skills"].get(sk, 0) + 1)
 
-                        self.on_status(f"{label} ({dt:.1f}s)")
+                        self.on_status(f"{prefix}{label} ({dt:.1f}s)")
                         self._update_stats()
 
                         result_json = json.dumps(result, default=str)
@@ -447,6 +744,7 @@ class LongevityClawAgent:
                             "content": result_json,
                         })
                     except Exception as e:
+                        self._stop_thinking_timer()
                         set_predict_progress(None)
                         set_individual_progress(None)
                         set_train_progress(None)
@@ -484,6 +782,7 @@ class LongevityClawAgent:
                 self.messages.append({"role": "user", "content": tool_results})
             else:
                 # No tool results to send back — return any text we have
+                self._generating = False
                 return "\n".join(text_parts) if text_parts else "(no response)"
 
     def _on_clock_progress(self, msg: str):
